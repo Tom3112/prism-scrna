@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Data files (large; reproducible via data/download.py)
+data/*.h5ad
+data/string_graph_score700.npz
+data/benchmarks/
+
+# Checkpoints and experiment artifacts
+checkpoints/
+experiments/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Build / dist
+*.egg-info/
+dist/
+build/
+
+# Local Claude Code settings
+.claude/settings.local.json
+
+# macOS
+.DS_Store
