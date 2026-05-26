@@ -107,9 +107,11 @@ def train_one_fold(
                             mask_ratio=data_cfg.mask_ratio, mode="finetune")
 
     train_loader = DataLoader(train_ds, batch_size=ft_cfg.batch_size,
-                              shuffle=True, num_workers=0, pin_memory=False)
+                              shuffle=True, num_workers=data_cfg.num_workers,
+                              pin_memory=device.type == "cuda")
     test_loader  = DataLoader(test_ds,  batch_size=ft_cfg.batch_size,
-                              shuffle=False, num_workers=0, pin_memory=False)
+                              shuffle=False, num_workers=data_cfg.num_workers,
+                              pin_memory=device.type == "cuda")
 
     vocab_size = train_ds.vocab_size
     encoder = scRNAEncoder(

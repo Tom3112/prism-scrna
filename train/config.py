@@ -5,9 +5,13 @@ Hyperparameters and path configuration for pretraining and fine-tuning.
 from __future__ import annotations
 
 import os
+import sys
 from dataclasses import dataclass, field
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+
+# macOS + MPS requires num_workers=0 due to multiprocessing fork conflicts.
+_DEFAULT_NUM_WORKERS = 0 if sys.platform == "darwin" else 4
 
 
 @dataclass
@@ -17,7 +21,7 @@ class DataConfig:
     mask_ratio: float = 0.15
     train_frac: float = 0.8
     val_frac: float = 0.1
-    num_workers: int = 0
+    num_workers: int = _DEFAULT_NUM_WORKERS
     seed: int = 42
 
 
