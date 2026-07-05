@@ -144,17 +144,29 @@ uv run python train/benchmark_eval.py --dataset BaronHuman --epochs 20
 
 ## Ablation Experiments
 
-| Experiment | Variable | Metric |
-|---|---|---|
-| Masking ratio | 5%, 15%, 25%, 40% | Val loss, downstream F1 |
-| Tokenization | Rank-based vs raw expression bins | Embedding UMAP quality |
-| Model depth | 2 / 4 / 6 layers | Val loss, fine-tune accuracy |
-| Pretrain vs scratch | Pretrained encoder vs random init | Fine-tune accuracy |
-| Freeze vs fine-tune | Frozen encoder vs full fine-tune | Fine-tune accuracy |
-| Gene embeddings | Baseline vs GNN frozen vs GNN joint | Fine-tune accuracy, UMAP |
-| Classification head | CLS linear vs CellGAT (PPI) | Fine-tune accuracy |
+Run with `uv run python train/ablations.py` (or `--experiment NAME` for a single one).
+Pretrain/fine-tune runs are cached on disk keyed by config, so shared baseline runs
+aren't recomputed across experiments. Results below are on PBMC 3k (2,700 cells,
+8 Leiden-derived cell types); see `notebooks/03_ablations.ipynb` for plots and
+`experiments/ablations/summary.md` for the raw tables.
 
-Run ablations in `notebooks/03_ablations.ipynb`.
+| Experiment | Variable | Metric | Result |
+|---|---|---|---|
+| Masking ratio | 5%, 15%, 25%, 40% | Val loss, downstream F1 | Best F1 at 5% and 40% (0.922, 0.924); 15–25% dipped lower (0.81–0.83) on this small dataset |
+| Tokenization | Rank-based vs raw expression bins | Embedding UMAP quality (silhouette) | Rank: **-0.136** vs expr_bin: -0.347 — rank ordering yields better-separated embeddings here |
+| Model depth | 2 / 4 / 6 layers | Val loss, fine-tune accuracy | Monotonic improvement with depth (acc 0.952 → 0.941 → **0.967** at 6 layers) |
+| Pretrain vs scratch | Pretrained encoder vs random init | Fine-tune accuracy | Scratch (0.952) ≈ pretrained (0.941) — labels are Leiden clusters of this same expression matrix, so the downstream task is largely solvable without MGP pretraining on this toy dataset |
+| Freeze vs fine-tune | Frozen encoder vs full fine-tune | Fine-tune accuracy | Full fine-tune **0.941** vs frozen 0.600 — frozen generic (30-epoch, small-data) representations are much weaker on their own |
+| Gene embeddings | Baseline vs GNN frozen vs GNN joint | Fine-tune accuracy, UMAP | All close (0.926–0.941 acc); GNN joint gives the best silhouette (-0.097 vs -0.136 baseline) |
+| Classification head | CLS linear vs CellGAT (PPI) | Fine-tune accuracy | CellGAT (0.944) slightly ahead of CLS (0.941) |
+
+Notes:
+- STRING PPI lookups 404 in this environment, so gene-embedding/CellGAT experiments
+  ran against the co-expression fallback graph (see `model/gene_graph.py`), not live
+  STRING data — rerun with STRING access for the intended PPI-informed comparison.
+- `val_loss` is only comparable *within* an experiment, not between tokenization
+  schemes: rank predicts over the full gene vocabulary (~2,000-way) while expr_bin
+  predicts over expression bins (11-way), so their losses live on different scales.
 
 ---
 

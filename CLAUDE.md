@@ -47,6 +47,7 @@ train/
   pretrain.py         # self-supervised pretraining loop
   finetune.py         # supervised cell-type classification (CLS head or CellGAT head)
   benchmark_eval.py   # 5-fold CV on 10 benchmark datasets vs scBiGNN / ACTINN
+  ablations.py        # runs the 7 ablation experiments (README "Ablation Experiments"), cached per-config
 
 eval/
   metrics.py          # accuracy, F1, confusion matrix
@@ -63,7 +64,8 @@ run_experiment.py     # full pipeline runner
 
 ## Key design decisions
 
-- Rank-based tokenization: genes sorted by descending expression per cell, following Geneformer
+- Rank-based tokenization (default, `DataConfig.tokenization="rank"`): genes sorted by descending expression per cell, following Geneformer
+- Expression-bin tokenization (`tokenization="expr_bin"`, scBERT-style): fixed gene panel shared by every cell, expression discretized into `n_bins` quantile bins; MGP pretraining masks the *bin id*, not gene identity (gene identity is fixed/known per position, so masking it would be trivially recoverable from the position embedding alone)
 - Special tokens: [PAD]=0, [CLS]=1, [MASK]=2; gene vocab starts at index 3
 - Pre-LayerNorm transformer for training stability
 - Masking applied only at dataset level during pretraining (labels=-100 for unmasked positions)

@@ -167,7 +167,7 @@ def run_finetune(run_dir: str, model_cfg, data_cfg) -> tuple[float, dict]:
     )
 
     t0 = time.time()
-    encoder, head = finetune(data_cfg=data_cfg, model_cfg=model_cfg, cfg=cfg)
+    encoder, head, _test_metrics = finetune(data_cfg=data_cfg, model_cfg=model_cfg, cfg=cfg)
     elapsed = time.time() - t0
 
     history = np.load(

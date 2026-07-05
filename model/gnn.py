@@ -9,6 +9,8 @@ No external GNN library required — uses only base PyTorch scatter operations.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -179,3 +181,36 @@ class GeneGAT(nn.Module):
         for layer, norm in zip(self.layers, self.norms):
             x = norm(x + layer(x, self.edge_index, self.edge_weight))   # residual
         return x
+
+
+def build_gene_gat(
+    gene_names: list[str],
+    model_cfg,
+    processed_path: str,
+    device: torch.device,
+) -> GeneGAT:
+    """
+    Builds a GeneGAT wired to the STRING PPI graph for `gene_names`, using the
+    GNN-related fields of ModelConfig (hidden_dim, gnn_layers, gnn_heads,
+    gnn_freeze, string_min_score). Shared by pretrain.py and finetune.py so
+    both construct an identical architecture (required to load a checkpoint
+    trained with use_gnn=True).
+    """
+    from model.gene_graph import build_gene_graph
+
+    edge_index, edge_weight = build_gene_graph(
+        gene_names,
+        cache_dir=os.path.dirname(processed_path),
+        min_score=model_cfg.string_min_score,
+        processed_path=processed_path,
+    )
+    return GeneGAT(
+        n_genes=len(gene_names),
+        hidden_dim=model_cfg.hidden_dim,
+        edge_index=edge_index.to(device),
+        edge_weight=edge_weight.to(device),
+        n_layers=model_cfg.gnn_layers,
+        n_heads=model_cfg.gnn_heads,
+        dropout=model_cfg.dropout,
+        freeze=model_cfg.gnn_freeze,
+    ).to(device)

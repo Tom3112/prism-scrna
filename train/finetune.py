@@ -23,11 +23,12 @@ import anndata as ad
 
 from data.dataset import load_datasets
 from model.transformer import scRNAEncoder
+from model.gnn import build_gene_gat
 from model.heads import CellTypeClassificationHead, CellGATClassificationHead
 from model.gene_graph import build_gene_graph
 from train.config import DataConfig, ModelConfig, FinetuneConfig
 from train.pretrain import get_cosine_schedule_with_warmup
-from eval.metrics import _forward_head
+from eval.metrics import _forward_head, evaluate
 
 
 # ---------------------------------------------------------------------------
@@ -184,6 +185,14 @@ def finetune(
     )
 
     # Build encoder
+    gene_gat = None
+    if model_cfg.use_gnn:
+        print("Building PPI graph for GeneGAT gene embeddings...")
+        tmp_adata = ad.read_h5ad(data_cfg.processed_path)
+        gene_names = list(tmp_adata.var_names)
+        del tmp_adata
+        gene_gat = build_gene_gat(gene_names, model_cfg, data_cfg.processed_path, device)
+
     encoder = scRNAEncoder(
         vocab_size=vocab_size,
         hidden_dim=model_cfg.hidden_dim,
@@ -192,6 +201,7 @@ def finetune(
         ffn_dim=model_cfg.ffn_dim,
         dropout=model_cfg.dropout,
         max_seq_len=data_cfg.max_seq_len,
+        gene_gat=gene_gat,
     ).to(device)
 
     # Load pretrained weights if checkpoint exists
@@ -284,12 +294,11 @@ def finetune(
     ckpt = torch.load(cfg.best_ckpt, map_location=device)
     encoder.load_state_dict(ckpt["encoder_state"])
     head.load_state_dict(ckpt["head_state"])
-    test_loss, test_acc = val_epoch(encoder, head, test_loader, device)
-    print(f"Test accuracy: {test_acc:.4f}  |  Test loss: {test_loss:.4f}")
+    test_metrics = evaluate(encoder, head, test_loader, device, label_names)
 
     history_path = os.path.join(cfg.checkpoint_dir, "finetune_history.npy")
     np.save(history_path, history)
-    return encoder, head
+    return encoder, head, test_metrics
 
 
 if __name__ == "__main__":

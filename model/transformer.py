@@ -42,6 +42,7 @@ class scRNAEncoder(nn.Module):
         max_seq_len: int = 512,
         pad_token_id: int = 0,
         gene_gat=None,          # GeneGAT | None
+        n_expr_bins: int | None = None,  # set for "expr_bin" tokenization
     ):
         super().__init__()
         if ffn_dim is None:
@@ -49,6 +50,11 @@ class scRNAEncoder(nn.Module):
         self.hidden_dim   = hidden_dim
         self.pad_token_id = pad_token_id
         self.use_gnn      = gene_gat is not None
+
+        # bins 0..n_expr_bins (n_expr_bins + 1 values) plus one MASK_BIN sentinel
+        self.bin_emb = (
+            nn.Embedding(n_expr_bins + 2, hidden_dim) if n_expr_bins is not None else None
+        )
 
         if self.use_gnn:
             # GNN path: GAT produces gene embeddings; special tokens use a small lookup
@@ -123,12 +129,16 @@ class scRNAEncoder(nn.Module):
         self,
         input_ids: torch.Tensor,        # (B, L)
         attention_mask: torch.Tensor,   # (B, L), 1=real 0=pad
+        bin_ids: torch.Tensor | None = None,  # (B, L), only for "expr_bin" tokenization
     ) -> torch.Tensor:
         """Returns (B, L, hidden_dim) hidden states."""
         B, L = input_ids.shape
         positions = torch.arange(L, device=input_ids.device).unsqueeze(0)  # (1, L)
 
         x = self._embed_tokens(input_ids) + self.pos_emb(positions)        # (B, L, D)
+        if self.bin_emb is not None:
+            assert bin_ids is not None, "bin_ids required when n_expr_bins is set"
+            x = x + self.bin_emb(bin_ids)
         x = self.emb_drop(self.emb_norm(x))
 
         pad_mask = attention_mask == 0                                      # True where padded
@@ -139,6 +149,7 @@ class scRNAEncoder(nn.Module):
         self,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
+        bin_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Returns the [CLS] token embedding (B, hidden_dim)."""
-        return self.forward(input_ids, attention_mask)[:, 0, :]
+        return self.forward(input_ids, attention_mask, bin_ids)[:, 0, :]

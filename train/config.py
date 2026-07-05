@@ -23,6 +23,9 @@ class DataConfig:
     val_frac: float = 0.1
     num_workers: int = _DEFAULT_NUM_WORKERS
     seed: int = 42
+    # Tokenization scheme: "rank" (Geneformer-style) or "expr_bin" (scBERT-style)
+    tokenization: str = "rank"
+    n_bins: int = 10  # non-zero expression bins, only used for "expr_bin"
 
 
 @dataclass

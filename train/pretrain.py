@@ -9,6 +9,7 @@ import os
 import random
 import time
 
+import anndata as ad
 import numpy as np
 import torch
 from torch.optim import AdamW
@@ -18,6 +19,7 @@ from tqdm import tqdm
 
 from data.dataset import load_datasets
 from model.transformer import scRNAEncoder
+from model.gnn import build_gene_gat
 from model.heads import MaskedGenePredictionHead
 from train.config import DataConfig, ModelConfig, PretrainConfig
 
@@ -76,8 +78,9 @@ def train_epoch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        bin_ids = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
-        hidden = encoder(input_ids, attention_mask)
+        hidden = encoder(input_ids, attention_mask, bin_ids)
         loss, logits = head(hidden, labels)
 
         optimizer.zero_grad()
@@ -111,8 +114,9 @@ def val_epoch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        bin_ids = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
-        hidden = encoder(input_ids, attention_mask)
+        hidden = encoder(input_ids, attention_mask, bin_ids)
         loss, logits = head(hidden, labels)
 
         total_loss += loss.item()
@@ -158,6 +162,8 @@ def pretrain(
         train_frac=data_cfg.train_frac,
         val_frac=data_cfg.val_frac,
         seed=data_cfg.seed,
+        tokenization=data_cfg.tokenization,
+        n_bins=data_cfg.n_bins,
     )
     vocab_size = splits["vocab_size"]
     print(f"Vocab size: {vocab_size}  |  Train cells: {len(splits['pretrain_train'])}  |  Val cells: {len(splits['pretrain_val'])}")
@@ -178,6 +184,14 @@ def pretrain(
     )
 
     # Model
+    gene_gat = None
+    if model_cfg.use_gnn:
+        print("Building PPI graph for GeneGAT gene embeddings...")
+        tmp_adata = ad.read_h5ad(data_cfg.processed_path)
+        gene_names = list(tmp_adata.var_names)
+        del tmp_adata
+        gene_gat = build_gene_gat(gene_names, model_cfg, data_cfg.processed_path, device)
+
     encoder = scRNAEncoder(
         vocab_size=vocab_size,
         hidden_dim=model_cfg.hidden_dim,
@@ -186,8 +200,14 @@ def pretrain(
         ffn_dim=model_cfg.ffn_dim,
         dropout=model_cfg.dropout,
         max_seq_len=data_cfg.max_seq_len,
+        n_expr_bins=(data_cfg.n_bins if data_cfg.tokenization == "expr_bin" else None),
+        gene_gat=gene_gat,
     ).to(device)
-    head = MaskedGenePredictionHead(model_cfg.hidden_dim, vocab_size).to(device)
+    # expr_bin mode predicts the masked expression bin (0..n_bins); gene identity
+    # is always visible (fixed panel), so predicting it would be trivial from
+    # position alone. rank mode predicts the masked gene identity as usual.
+    n_pred_classes = (data_cfg.n_bins + 1) if data_cfg.tokenization == "expr_bin" else vocab_size
+    head = MaskedGenePredictionHead(model_cfg.hidden_dim, n_pred_classes).to(device)
 
     n_params = sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in head.parameters())
     print(f"Model parameters: {n_params:,}")
