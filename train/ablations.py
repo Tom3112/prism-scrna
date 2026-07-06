@@ -1,5 +1,7 @@
 """
-Runs the 7 ablation experiments listed in README.md's "Ablation Experiments" table.
+Runs the 8 ablation experiments listed in README.md's "Ablation Experiments" table
+(7 from the original project brief, plus gnn_depth — added after cross-referencing
+the GNN-in-single-cell-omics review that motivated PRISM's GeneGAT/CellGAT design).
 
 Each experiment varies one axis of DataConfig/ModelConfig/PretrainConfig/FinetuneConfig and
 reuses pretrain()/finetune() from train/pretrain.py and train/finetune.py. Pretrain and finetune
@@ -7,7 +9,7 @@ runs are cached on disk (keyed by the config fields that affect their outcome) s
 baseline runs are not recomputed across experiments.
 
 Usage:
-    uv run python train/ablations.py                       # all 7 experiments
+    uv run python train/ablations.py                       # all 8 experiments
     uv run python train/ablations.py --experiment masking_ratio
 """
 
@@ -23,14 +25,10 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-import anndata as ad
-
 from data.dataset import load_datasets
-from eval.metrics import evaluate
 from eval.visualise import extract_cls_embeddings, umap_reduce
 from model.transformer import scRNAEncoder
 from model.gnn import build_gene_gat
-from model.heads import CellTypeClassificationHead
 from train.config import DataConfig, ModelConfig, PretrainConfig, FinetuneConfig
 from train.pretrain import pretrain
 from train.finetune import finetune
@@ -134,10 +132,7 @@ def embedding_silhouette(pretrain_ckpt: str, data_cfg: DataConfig, model_cfg: Mo
 
     gene_gat = None
     if model_cfg.use_gnn:
-        tmp_adata = ad.read_h5ad(data_cfg.processed_path)
-        gene_names = list(tmp_adata.var_names)
-        del tmp_adata
-        gene_gat = build_gene_gat(gene_names, model_cfg, data_cfg.processed_path, device)
+        gene_gat = build_gene_gat(model_cfg, data_cfg.processed_path, device)
 
     encoder = scRNAEncoder(
         vocab_size=ckpt["vocab_size"], hidden_dim=model_cfg.hidden_dim, num_layers=model_cfg.num_layers,
@@ -156,7 +151,7 @@ def embedding_silhouette(pretrain_ckpt: str, data_cfg: DataConfig, model_cfg: Mo
 
 
 # ---------------------------------------------------------------------------
-# The 7 experiments
+# The 8 experiments
 # ---------------------------------------------------------------------------
 
 def experiment_masking_ratio(device: torch.device) -> list[dict]:
@@ -255,6 +250,32 @@ def experiment_gene_embeddings(device: torch.device) -> list[dict]:
     return results
 
 
+def experiment_gnn_depth(device: torch.device) -> list[dict]:
+    """
+    GeneGAT depth (1 / 2 / 3 layers), jointly trained (gnn_freeze=False) so the
+    GAT weights actually update — a frozen GAT can't exhibit over-smoothing.
+    Motivated by the GNN-in-single-cell-omics review's central caution that
+    "increasing the number of layers exacerbates over-smoothing, where node
+    representations become overly similar." 2 layers is GeneGAT's default and
+    matches gene_embeddings' "gnn_joint" condition, so that pretrain/finetune
+    pair is reused rather than recomputed.
+    """
+    data_cfg = DataConfig()
+    results = []
+    for gnn_layers in [1, 2, 3]:
+        print(f"\n-- gnn_depth={gnn_layers} --")
+        model_cfg = ModelConfig(use_gnn=True, gnn_freeze=False, gnn_layers=gnn_layers)
+        ckpt, _ = cached_pretrain(data_cfg, model_cfg)
+        metrics = cached_finetune(ckpt, data_cfg, model_cfg)
+        silhouette = embedding_silhouette(ckpt, data_cfg, model_cfg, device)
+        results.append({
+            "gnn_layers": gnn_layers,
+            "test_accuracy": metrics["accuracy"],
+            "umap_silhouette": silhouette,
+        })
+    return results
+
+
 def experiment_classification_head(device: torch.device) -> list[dict]:
     data_cfg = DataConfig()
     model_cfg = ModelConfig()
@@ -275,6 +296,7 @@ EXPERIMENTS = {
     "pretrain_vs_scratch": experiment_pretrain_vs_scratch,
     "freeze_vs_finetune": experiment_freeze_vs_finetune,
     "gene_embeddings": experiment_gene_embeddings,
+    "gnn_depth": experiment_gnn_depth,
     "classification_head": experiment_classification_head,
 }
 
@@ -307,7 +329,7 @@ def write_summary(all_results: dict[str, list[dict]]) -> str:
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--experiment", choices=list(EXPERIMENTS.keys()), default=None,
-                        help="Run a single experiment; omit to run all 7.")
+                        help="Run a single experiment; omit to run all 8.")
     args = parser.parse_args()
 
     os.makedirs(OUT_DIR, exist_ok=True)

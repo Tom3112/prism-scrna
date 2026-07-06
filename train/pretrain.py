@@ -9,7 +9,6 @@ import os
 import random
 import time
 
-import anndata as ad
 import numpy as np
 import torch
 from torch.optim import AdamW
@@ -68,11 +67,13 @@ def train_epoch(
     scheduler: LambdaLR,
     device: torch.device,
     grad_clip: float,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> tuple[float, float]:
     encoder.train()
     head.train()
     total_loss = 0.0
     total_acc = 0.0
+    amp_enabled = scaler is not None and scaler.is_enabled()
 
     for batch in tqdm(loader, desc="  train", leave=False):
         input_ids = batch["input_ids"].to(device)
@@ -80,15 +81,25 @@ def train_epoch(
         labels = batch["labels"].to(device)
         bin_ids = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
-        hidden = encoder(input_ids, attention_mask, bin_ids)
-        loss, logits = head(hidden, labels)
-
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(encoder.parameters()) + list(head.parameters()), grad_clip
-        )
-        optimizer.step()
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            hidden = encoder(input_ids, attention_mask, bin_ids)
+            loss, logits = head(hidden, labels)
+
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(head.parameters()), grad_clip
+            )
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(head.parameters()), grad_clip
+            )
+            optimizer.step()
         scheduler.step()
 
         total_loss += loss.item()
@@ -104,6 +115,7 @@ def val_epoch(
     head: MaskedGenePredictionHead,
     loader: DataLoader,
     device: torch.device,
+    amp_enabled: bool = False,
 ) -> tuple[float, float]:
     encoder.eval()
     head.eval()
@@ -116,8 +128,9 @@ def val_epoch(
         labels = batch["labels"].to(device)
         bin_ids = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
-        hidden = encoder(input_ids, attention_mask, bin_ids)
-        loss, logits = head(hidden, labels)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            hidden = encoder(input_ids, attention_mask, bin_ids)
+            loss, logits = head(hidden, labels)
 
         total_loss += loss.item()
         total_acc += masked_accuracy(logits, labels)
@@ -187,10 +200,7 @@ def pretrain(
     gene_gat = None
     if model_cfg.use_gnn:
         print("Building PPI graph for GeneGAT gene embeddings...")
-        tmp_adata = ad.read_h5ad(data_cfg.processed_path)
-        gene_names = list(tmp_adata.var_names)
-        del tmp_adata
-        gene_gat = build_gene_gat(gene_names, model_cfg, data_cfg.processed_path, device)
+        gene_gat = build_gene_gat(model_cfg, data_cfg.processed_path, device)
 
     encoder = scRNAEncoder(
         vocab_size=vocab_size,
@@ -220,6 +230,7 @@ def pretrain(
     )
     total_steps = cfg.epochs * len(train_loader)
     scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.warmup_steps, total_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # Training loop
     best_val_loss = float("inf")
@@ -228,9 +239,9 @@ def pretrain(
     for epoch in range(1, cfg.epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
-            encoder, head, train_loader, optimizer, scheduler, device, cfg.grad_clip
+            encoder, head, train_loader, optimizer, scheduler, device, cfg.grad_clip, scaler
         )
-        val_loss, val_acc = val_epoch(encoder, head, val_loader, device)
+        val_loss, val_acc = val_epoch(encoder, head, val_loader, device, amp_enabled=scaler.is_enabled())
         elapsed = time.time() - t0
 
         history["train_loss"].append(train_loss)

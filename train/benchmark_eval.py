@@ -2,10 +2,14 @@
 5-fold cross-validation evaluation on standard benchmark datasets.
 
 Compares our model against published baselines:
-  - Original 5 (scBiGNN, Ma et al. 2023, Table 2)
-  - Extended 5 (ACTINN, Chen et al. 2019, Tables 2-3)
-
-All 10 datasets are from the same Zenodo archive (Abdelaal et al. 2019).
+  - Original 5 (scBiGNN, Ma et al. 2023, Table 2) — verified exact match
+  - Segerstolpe/Muraro (ACTINN, Ma & Pellegrini 2020) — from the same Abdelaal
+    et al. 2019 benchmark suite (Zenodo 3357167); dataset stats verified against
+    Abdelaal's Table 2, accuracy values not independently re-derived from the
+    source figure
+  - Zeisel/Macosko/Klein: no verified baseline. Despite prior attribution to
+    Abdelaal et al. 2019, these 3 datasets do not appear in that paper or in
+    scBiGNN's — reported standalone rather than against an unconfirmed number.
 
   Dataset      | Baseline | Method   | ours
   -------------|----------|----------|-----
@@ -14,11 +18,11 @@ All 10 datasets are from the same Zenodo archive (Abdelaal et al. 2019).
   BaronHuman   |  0.983   | scBiGNN  |  ?
   BaronMouse   |  0.983   | scBiGNN  |  ?
   AMB          |  0.994   | scBiGNN  |  ?
-  Zeisel       |  0.944   | ACTINN   |  ?
   Segerstolpe  |  0.886   | ACTINN   |  ?
   Muraro       |  0.962   | ACTINN   |  ?
-  Macosko      |  0.798   | ACTINN   |  ?
-  Klein        |  0.979   | ACTINN   |  ?
+  Zeisel       |    —     |    —     |  ?
+  Macosko      |    —     |    —     |  ?
+  Klein        |    —     |    —     |  ?
 
 Usage:
     uv run python train/benchmark_eval.py
@@ -52,9 +56,13 @@ from eval.metrics import collect_predictions, compute_metrics, _forward_head
 
 # Published baselines for 5-fold CV accuracy.
 #
-# Original 5: scBiGNN (Ma et al. 2023, Table 2) — direct comparison target.
-# Extended 5: ACTINN (Chen et al. 2019, Tables 2-3) — strong supervised baseline
-#             from the same Abdelaal et al. 2019 benchmark suite.
+# Original 5: scBiGNN (Ma et al. 2023, Table 2) — verified exact match, direct
+#             comparison target.
+# Segerstolpe/Muraro: ACTINN (Ma & Pellegrini 2020), from the same Abdelaal
+#             et al. 2019 benchmark suite.
+# Zeisel/Macosko/Klein have no entry here — no verified baseline (see module
+# docstring); evaluate_dataset() reports these standalone via BASELINES.get()'s
+# (None, None) default.
 BASELINES: dict[str, tuple[str, float]] = {
     # dataset          method      accuracy
     "Zheng68K":    ("scBiGNN",  0.760),
@@ -62,11 +70,8 @@ BASELINES: dict[str, tuple[str, float]] = {
     "BaronHuman":  ("scBiGNN",  0.983),
     "BaronMouse":  ("scBiGNN",  0.983),
     "AMB":         ("scBiGNN",  0.994),
-    "Zeisel":      ("ACTINN",   0.944),
     "Segerstolpe": ("ACTINN",   0.886),
     "Muraro":      ("ACTINN",   0.962),
-    "Macosko":     ("ACTINN",   0.798),
-    "Klein":       ("ACTINN",   0.979),
 }
 
 # Keep old name as alias for backward compatibility
@@ -151,6 +156,7 @@ def train_one_fold(
     )
     total_steps = ft_cfg.epochs * len(train_loader)
     scheduler = get_cosine_schedule_with_warmup(optimizer, ft_cfg.warmup_steps, total_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     for epoch in range(1, ft_cfg.epochs + 1):
         encoder.train(); head.train()
@@ -158,11 +164,21 @@ def train_one_fold(
             ids  = batch["input_ids"].to(device)
             amsk = batch["attention_mask"].to(device)
             ct   = batch["cell_type"].to(device)
-            loss, _ = _forward_head(encoder, head, ids, amsk, ct)
-            optimizer.zero_grad(); loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(head.parameters()), ft_cfg.grad_clip)
-            optimizer.step(); scheduler.step()
+            optimizer.zero_grad()
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled()):
+                loss, _ = _forward_head(encoder, head, ids, amsk, ct)
+            params = list(encoder.parameters()) + list(head.parameters())
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, ft_cfg.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, ft_cfg.grad_clip)
+                optimizer.step()
+            scheduler.step()
 
     preds, labels = collect_predictions(encoder, head, test_loader, device)
     metrics = compute_metrics(preds, labels, all_cats)

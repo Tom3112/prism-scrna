@@ -79,23 +79,34 @@ def train_epoch(
     scheduler: LambdaLR,
     device: torch.device,
     grad_clip: float,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> tuple[float, float]:
     encoder.train()
     head.train()
     total_loss, total_acc = 0.0, 0.0
+    amp_enabled = scaler is not None and scaler.is_enabled()
 
     for batch in tqdm(loader, desc="  train", leave=False):
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         cell_type      = batch["cell_type"].to(device)
-
-        loss, logits = _forward_head(encoder, head, input_ids, attention_mask, cell_type)
+        bin_ids        = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
         optimizer.zero_grad()
-        loss.backward()
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            loss, logits = _forward_head(encoder, head, input_ids, attention_mask, cell_type, bin_ids)
+
         params = list(encoder.parameters()) + list(head.parameters())
-        torch.nn.utils.clip_grad_norm_(params, grad_clip)
-        optimizer.step()
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(params, grad_clip)
+            optimizer.step()
         scheduler.step()
 
         total_loss += loss.item()
@@ -111,6 +122,7 @@ def val_epoch(
     head,
     loader: DataLoader,
     device: torch.device,
+    amp_enabled: bool = False,
 ) -> tuple[float, float]:
     encoder.eval()
     head.eval()
@@ -120,8 +132,10 @@ def val_epoch(
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         cell_type      = batch["cell_type"].to(device)
+        bin_ids        = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
-        loss, logits = _forward_head(encoder, head, input_ids, attention_mask, cell_type)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            loss, logits = _forward_head(encoder, head, input_ids, attention_mask, cell_type, bin_ids)
 
         total_loss += loss.item()
         total_acc  += batch_accuracy(logits, cell_type)
@@ -165,6 +179,8 @@ def finetune(
         train_frac=data_cfg.train_frac,
         val_frac=data_cfg.val_frac,
         seed=data_cfg.seed,
+        tokenization=data_cfg.tokenization,
+        n_bins=data_cfg.n_bins,
     )
     vocab_size = splits["vocab_size"]
     num_classes = splits["num_classes"]
@@ -188,10 +204,7 @@ def finetune(
     gene_gat = None
     if model_cfg.use_gnn:
         print("Building PPI graph for GeneGAT gene embeddings...")
-        tmp_adata = ad.read_h5ad(data_cfg.processed_path)
-        gene_names = list(tmp_adata.var_names)
-        del tmp_adata
-        gene_gat = build_gene_gat(gene_names, model_cfg, data_cfg.processed_path, device)
+        gene_gat = build_gene_gat(model_cfg, data_cfg.processed_path, device)
 
     encoder = scRNAEncoder(
         vocab_size=vocab_size,
@@ -201,6 +214,7 @@ def finetune(
         ffn_dim=model_cfg.ffn_dim,
         dropout=model_cfg.dropout,
         max_seq_len=data_cfg.max_seq_len,
+        n_expr_bins=(data_cfg.n_bins if data_cfg.tokenization == "expr_bin" else None),
         gene_gat=gene_gat,
     ).to(device)
 
@@ -250,6 +264,7 @@ def finetune(
     optimizer = AdamW(trainable, lr=cfg.lr, weight_decay=cfg.weight_decay)
     total_steps = cfg.epochs * len(train_loader)
     scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.warmup_steps, total_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # Training loop
     best_val_acc = 0.0
@@ -257,8 +272,8 @@ def finetune(
 
     for epoch in range(1, cfg.epochs + 1):
         t0 = time.time()
-        train_loss, train_acc = train_epoch(encoder, head, train_loader, optimizer, scheduler, device, cfg.grad_clip)
-        val_loss, val_acc = val_epoch(encoder, head, val_loader, device)
+        train_loss, train_acc = train_epoch(encoder, head, train_loader, optimizer, scheduler, device, cfg.grad_clip, scaler)
+        val_loss, val_acc = val_epoch(encoder, head, val_loader, device, amp_enabled=scaler.is_enabled())
         elapsed = time.time() - t0
 
         history["train_loss"].append(train_loss)

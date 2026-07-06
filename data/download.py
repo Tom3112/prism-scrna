@@ -1,7 +1,10 @@
 """
 Download scRNA data for pretraining.
 
-Uses scanpy.datasets.pbmc3k() as a smoke-test dataset (~2.7k cells).
+Uses scanpy.datasets.pbmc3k_processed() as a smoke-test dataset (~2.6k cells) —
+the canonical scanpy clustering-tutorial PBMC3k with real expert-derived
+louvain cell-type annotations (CD4 T, CD14+ Monocytes, B, CD8 T, NK,
+FCGR3A+ Monocytes, Dendritic, Megakaryocytes), not unsupervised pseudo-labels.
 For the full 10k PBMC dataset, set USE_10K=True and provide a valid
 download directory; the script will fetch it from 10x Genomics.
 """
@@ -15,8 +18,8 @@ USE_10K = False  # flip to True to download the full 10k dataset
 
 
 def download_pbmc3k() -> sc.AnnData:
-    print("Loading PBMC 3k dataset via scanpy...")
-    adata = sc.datasets.pbmc3k()
+    print("Loading PBMC 3k (processed, annotated) dataset via scanpy...")
+    adata = sc.datasets.pbmc3k_processed()
     adata.write_h5ad(RAW_PATH)
     print(f"Saved {adata.n_obs} cells to {RAW_PATH}")
     return adata

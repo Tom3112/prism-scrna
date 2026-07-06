@@ -67,7 +67,9 @@ def _fetch_string(gene_names: list[str], min_score: int, cache_path: str) -> tup
             # Undirected: add both directions
             src_list += [i, j]
             dst_list += [j, i]
-            w_list   += [score / 1000.0, score / 1000.0]
+            # STRING's api/tsv/network "score" column is already normalised to
+            # 0-1 (not 0-1000 as older docs/screenshots suggest) — use as-is.
+            w_list   += [score, score]
 
     src = np.array(src_list, dtype=np.int64)
     dst = np.array(dst_list, dtype=np.int64)

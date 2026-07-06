@@ -184,19 +184,25 @@ class GeneGAT(nn.Module):
 
 
 def build_gene_gat(
-    gene_names: list[str],
     model_cfg,
     processed_path: str,
     device: torch.device,
 ) -> GeneGAT:
     """
-    Builds a GeneGAT wired to the STRING PPI graph for `gene_names`, using the
-    GNN-related fields of ModelConfig (hidden_dim, gnn_layers, gnn_heads,
-    gnn_freeze, string_min_score). Shared by pretrain.py and finetune.py so
-    both construct an identical architecture (required to load a checkpoint
-    trained with use_gnn=True).
+    Builds a GeneGAT wired to the STRING PPI graph for the genes in
+    `processed_path`, using the GNN-related fields of ModelConfig (hidden_dim,
+    gnn_layers, gnn_heads, gnn_freeze, string_min_score). Shared by
+    pretrain.py, finetune.py, and ablations.py so all three construct an
+    identical architecture (required to load a checkpoint trained with
+    use_gnn=True).
+
+    Reads gene names directly (backed mode — skips loading the expression
+    matrix) rather than requiring the caller to have already loaded the adata.
     """
+    import anndata as ad
     from model.gene_graph import build_gene_graph
+
+    gene_names = list(ad.read_h5ad(processed_path, backed="r").var_names)
 
     edge_index, edge_weight = build_gene_graph(
         gene_names,

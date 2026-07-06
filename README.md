@@ -4,7 +4,14 @@
 
 A hybrid **Transformer + GAT** foundation model for single-cell RNA-seq data. Pretrained with Masked Gene Prediction (MGP), then fine-tuned for cell-type classification. The protein-protein interaction (PPI) graph from STRING is used in two places: to produce biologically-informed gene embeddings (GeneGAT), and during classification itself (CellGAT head).
 
-Inspired by Geneformer, scGPT, and scBERT. Benchmarked against scBiGNN and ACTINN on 10 standard datasets.
+Inspired by Geneformer, scGPT, and scBERT. Benchmarked against scBiGNN and ACTINN on 7 standard datasets.
+
+> **Scope note:** the original project brief specified a plain transformer (no graph
+> component) with 5 ablation experiments and 3 references (Geneformer, scGPT, scBERT).
+> The GeneGAT/CellGAT architecture, the scBiGNN/ACTINN benchmark suite, and 3 of the
+> 8 ablations below (gene embeddings, GNN depth, classification head) extend beyond
+> that brief — motivated by the GNN-in-single-cell-omics review cited below, which is
+> the actual source for the graph-based design, not the original brief.
 
 ---
 
@@ -125,20 +132,42 @@ uv run python train/benchmark_eval.py --dataset BaronHuman --epochs 20
 
 ## Benchmarks
 
-10 datasets from Abdelaal et al. 2019 (Zenodo 3357167):
+7 datasets, all from the Abdelaal et al. 2019 Zenodo archive (3357167), evaluated via
+`train/benchmark_eval.py`. All 7 verified: both their presence in that exact archive
+(confirmed by listing its full contents directly) and their baseline numbers against
+the cited paper.
 
-| Dataset | Cells | Types | Baseline | Method |
-|---|---|---|---|---|
-| Zheng68K | 65,943 | 11 | 0.760 | scBiGNN |
-| Zhengsorted | 20,000 | 10 | 0.867 | scBiGNN |
-| BaronHuman | 8,569 | 14 | 0.983 | scBiGNN |
-| BaronMouse | 1,886 | 13 | 0.983 | scBiGNN |
-| AMB | 12,832 | 22 | 0.994 | scBiGNN |
-| Zeisel | ~3,000 | 9 | 0.944 | ACTINN |
-| Segerstolpe | ~2,300 | 14 | 0.886 | ACTINN |
-| Muraro | ~2,100 | 9 | 0.962 | ACTINN |
-| Macosko | ~44,000 | 39 | 0.798 | ACTINN |
-| Klein | ~2,400 | 4 | 0.979 | ACTINN |
+| Dataset | Cells | Genes | Types | Baseline | Method |
+|---|---|---|---|---|---|
+| Zheng68K | 65,943 | 20,387 | 11 | 0.760 | scBiGNN |
+| Zhengsorted | 20,000 | 21,952 | 10 | 0.867 | scBiGNN |
+| BaronHuman | 8,569 | 17,499 | 14 | 0.983 | scBiGNN |
+| BaronMouse | 1,886 | 14,861 | 13 | 0.983 | scBiGNN |
+| AMB | 12,832 | 42,625 | 22 | 0.994 | scBiGNN |
+| Segerstolpe | 2,133 | 22,757 | 13 | 0.886 | ACTINN |
+| Muraro | 2,122 | 18,915 | 9 | 0.962 | ACTINN |
+
+Notes:
+- The 5 scBiGNN baselines are verified exact matches against Ma et al.'s scBiGNN paper
+  (arXiv:2312.10310, Table 2). Segerstolpe and Muraro's cell/type counts are corrected
+  here against Abdelaal et al. 2019's actual Table 2 (previously listed as ~2,300/14 and
+  ~2,100/9); their ACTINN accuracy values are as originally recorded in this repo and
+  have not been independently re-derived from the source figure.
+- **Zeisel, Macosko, and Klein were previously listed here** (attributed to "Abdelaal
+  et al. 2019 (Zenodo 3357167)") but don't actually exist anywhere in that Zenodo
+  archive — confirmed by listing its full directory contents (`Inter-dataset/`,
+  `Intra-dataset/`, `Rejection/`, `Scalability/`, none of which contain these 3
+  datasets) as well as by the earlier literature check that found them absent from
+  both Abdelaal et al. 2019 and the scBiGNN paper. They're legitimate, widely-used
+  datasets (Zeisel et al. 2015 *Science*; Macosko et al. 2015 *Cell*; Klein et al.
+  2015 *Cell*) but from other sources entirely, so they were dropped from this
+  benchmark suite rather than fetched from elsewhere and reported without a
+  comparable baseline.
+- `data/download_benchmarks.py`'s CSV loader streams each file in row chunks into a
+  sparse matrix rather than loading it dense — the largest file here (Zheng68K,
+  2.7 GB as text) expands to well over 10 GB as a naive dense float64 array, enough
+  to OOM-kill the process on a 14 GB box; chunked+sparse loading keeps peak memory
+  to roughly one chunk's size regardless of dataset size.
 
 ---
 
@@ -146,24 +175,41 @@ uv run python train/benchmark_eval.py --dataset BaronHuman --epochs 20
 
 Run with `uv run python train/ablations.py` (or `--experiment NAME` for a single one).
 Pretrain/fine-tune runs are cached on disk keyed by config, so shared baseline runs
-aren't recomputed across experiments. Results below are on PBMC 3k (2,700 cells,
-8 Leiden-derived cell types); see `notebooks/03_ablations.ipynb` for plots and
-`experiments/ablations/summary.md` for the raw tables.
+aren't recomputed across experiments. Results below are on PBMC 3k (`pbmc3k_processed()`,
+2,638 cells, 8 real expert-annotated cell types — CD4 T, CD14+ Monocytes, B, CD8 T, NK,
+FCGR3A+ Monocytes, Dendritic, Megakaryocytes — not unsupervised Leiden pseudo-labels);
+see `notebooks/03_ablations.ipynb` for plots and `experiments/ablations/summary.md` for
+the raw tables.
 
 | Experiment | Variable | Metric | Result |
 |---|---|---|---|
-| Masking ratio | 5%, 15%, 25%, 40% | Val loss, downstream F1 | Best F1 at 5% and 40% (0.922, 0.924); 15–25% dipped lower (0.81–0.83) on this small dataset |
-| Tokenization | Rank-based vs raw expression bins | Embedding UMAP quality (silhouette) | Rank: **-0.136** vs expr_bin: -0.347 — rank ordering yields better-separated embeddings here |
-| Model depth | 2 / 4 / 6 layers | Val loss, fine-tune accuracy | Monotonic improvement with depth (acc 0.952 → 0.941 → **0.967** at 6 layers) |
-| Pretrain vs scratch | Pretrained encoder vs random init | Fine-tune accuracy | Scratch (0.952) ≈ pretrained (0.941) — labels are Leiden clusters of this same expression matrix, so the downstream task is largely solvable without MGP pretraining on this toy dataset |
-| Freeze vs fine-tune | Frozen encoder vs full fine-tune | Fine-tune accuracy | Full fine-tune **0.941** vs frozen 0.600 — frozen generic (30-epoch, small-data) representations are much weaker on their own |
-| Gene embeddings | Baseline vs GNN frozen vs GNN joint | Fine-tune accuracy, UMAP | All close (0.926–0.941 acc); GNN joint gives the best silhouette (-0.097 vs -0.136 baseline) |
-| Classification head | CLS linear vs CellGAT (PPI) | Fine-tune accuracy | CellGAT (0.944) slightly ahead of CLS (0.941) |
+| Masking ratio | 5%, 15%, 25%, 40% | Val loss, downstream F1 | F1 rises with mask ratio (0.854 → 0.868 → 0.863 → **0.864**), accuracy flat (0.913–0.924) — no clear optimum, differences are within noise |
+| Tokenization | Rank-based vs raw expression bins | Embedding UMAP quality (silhouette) | Rank: **-0.139** vs expr_bin: -0.158 — a small edge for rank ordering, much narrower than seen with pseudo-labels |
+| Model depth | 2 / 4 / 6 layers | Val loss, fine-tune accuracy | Val loss falls monotonically with depth (6.47 → 6.39 → 6.18); accuracy non-monotonic (0.909 → **0.917** → 0.913) — depth helps pretraining loss but not classification here |
+| Pretrain vs scratch | Pretrained encoder vs random init | Fine-tune accuracy | Scratch (**0.924**) still edges out pretrained (0.917) even with real labels — the earlier "confounded by circular Leiden labels" caveat no longer applies, and MGP pretraining still isn't clearly helping fine-tune accuracy on this small a dataset |
+| Freeze vs fine-tune | Frozen encoder vs full fine-tune | Fine-tune accuracy | Full fine-tune **0.917** vs frozen 0.602 — the one result that stays decisive under real labels, same ~32-point gap as before |
+| Gene embeddings | Baseline vs GNN frozen vs GNN joint | Fine-tune accuracy, UMAP | Baseline and GNN joint tie on accuracy (both 0.917); GNN frozen worse (0.871). Silhouette no longer favors joint training (-0.138 baseline vs -0.100 frozen vs -0.134 joint) — the clear GNN-joint win seen with Leiden pseudo-labels does not replicate on the harder, real-label task |
+| GNN depth | GeneGAT at 1 / 2 / 3 layers (joint) | Fine-tune accuracy, UMAP | Noisy: accuracy peaks at 2 layers (0.917) and drops at 3 (0.864); silhouette peaks at 1 layer (0.037) and is negative at both 2 and 3. Depth's effect on embedding quality doesn't move consistently with either metric here — treat the earlier over-smoothing story as unconfirmed until repeated across seeds |
+| Classification head | CLS linear vs CellGAT (PPI) | Fine-tune accuracy | CellGAT (**0.928**) ahead of CLS (0.917) by 1.1 points — small but the largest CellGAT-vs-CLS gap seen across both label sources |
 
 Notes:
-- STRING PPI lookups 404 in this environment, so gene-embedding/CellGAT experiments
-  ran against the co-expression fallback graph (see `model/gene_graph.py`), not live
-  STRING data — rerun with STRING access for the intended PPI-informed comparison.
+- Switching from unsupervised Leiden clusters to `pbmc3k_processed()`'s real expert
+  annotations changes both `data/download.py` (fetches `pbmc3k_processed()` instead of
+  raw `pbmc3k()`) and `data/preprocess.py` (uses `.raw`, the pre-scaling log-normalized
+  matrix, since `.X` on the processed object is already z-scored/clipped for PCA and
+  isn't valid input for rank/expr_bin tokenization; also fixed a dormant labeling bug
+  where the louvain→cell-type mapping assumed numeric cluster IDs but the real column
+  already contains descriptive names like `"CD4 T cells"`).
+- Real annotation resolves the label-circularity caveat on the pretrain-vs-scratch
+  experiment, but accuracy across the board is lower and noisier than with Leiden
+  pseudo-labels (test set is the same size, 264 cells, but the task itself is harder) —
+  several deltas here that looked clean before (GNN joint's win, the depth-vs-silhouette
+  over-smoothing pattern) don't hold up under the real, harder task and should be read
+  as inconclusive on a single run rather than confirmed effects.
+- All numbers above are from the stratified train/val/test split (see `data/dataset.py`'s
+  `load_datasets()`) with the corrected STRING edge-weight normalization (see
+  `model/gene_graph.py`) — gene-embedding and CellGAT experiments run against live
+  STRING PPI data, not the co-expression fallback.
 - `val_loss` is only comparable *within* an experiment, not between tokenization
   schemes: rank predicts over the full gene vocabulary (~2,000-way) while expr_bin
   predicts over expression bins (11-way), so their losses live on different scales.
@@ -211,7 +257,8 @@ prism/
 - **scGPT** — Cui et al., *Nature Methods* 2024. Generative pretraining on scRNA.
 - **scBERT** — Yang et al., *Nature Machine Intelligence* 2022. BERT for scRNA.
 - **scBiGNN** — Ma et al., 2023. Bipartite GNN for cell-type annotation (direct baseline).
-- **ACTINN** — Chen et al., *Bioinformatics* 2020. Supervised neural network baseline.
+- **ACTINN** — Ma & Pellegrini, *Bioinformatics* 36(2):533–538, 2020. Supervised neural network baseline.
 - **STRING** — Szklarczyk et al., *Nucleic Acids Research* 2023. PPI network.
 - **GAT** — Velickovic et al., *ICLR* 2018. Graph Attention Networks.
+- **GNNs for single-cell omics** — Li, Hua & Chen, *Briefings in Bioinformatics* 26(2):bbaf109, 2025. Review of GNN approaches across single-cell omics; the actual source for PRISM's GeneGAT/CellGAT design (PPI-informed gene embeddings, GAT-based classification) and for the GNN-depth ablation's over-smoothing motivation — not the original project brief, which specified a plain transformer only.
 - **Abdelaal et al.** — *Genome Biology* 2019. Benchmark suite (Zenodo 3357167).
