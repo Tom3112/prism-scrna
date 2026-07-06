@@ -133,19 +133,26 @@ uv run python train/benchmark_eval.py --dataset BaronHuman --epochs 20
 ## Benchmarks
 
 7 datasets, all from the Abdelaal et al. 2019 Zenodo archive (3357167), evaluated via
-`train/benchmark_eval.py`. All 7 verified: both their presence in that exact archive
-(confirmed by listing its full contents directly) and their baseline numbers against
-the cited paper.
+`train/benchmark_eval.py` (5-fold CV, CLS head, from-scratch supervised training —
+no MGP pretraining transfer, matching how scBiGNN/ACTINN themselves are evaluated).
+All 7 verified: both their presence in that exact archive (confirmed by listing its
+full contents directly) and their baseline numbers against the cited paper.
 
-| Dataset | Cells | Genes | Types | Baseline | Method |
-|---|---|---|---|---|---|
-| Zheng68K | 65,943 | 20,387 | 11 | 0.760 | scBiGNN |
-| Zhengsorted | 20,000 | 21,952 | 10 | 0.867 | scBiGNN |
-| BaronHuman | 8,569 | 17,499 | 14 | 0.983 | scBiGNN |
-| BaronMouse | 1,886 | 14,861 | 13 | 0.983 | scBiGNN |
-| AMB | 12,832 | 42,625 | 22 | 0.994 | scBiGNN |
-| Segerstolpe | 2,133 | 22,757 | 13 | 0.886 | ACTINN |
-| Muraro | 2,122 | 18,915 | 9 | 0.962 | ACTINN |
+| Dataset | Cells | Genes | Types | Baseline | Method | **PRISM (ours)** | Δ |
+|---|---|---|---|---|---|---|---|
+| Zheng68K | 65,943 | 20,387 | 11 | 0.760 | scBiGNN | **0.839 ± 0.002** | ▲ 7.89% |
+| Zhengsorted | 20,000 | 21,952 | 10 | 0.867 | scBiGNN | 0.822 ± 0.003 | ▼ 4.54% |
+| BaronHuman | 8,569 | 17,499 | 14 | 0.983 | scBiGNN | 0.985 ± 0.002 | ▲ 0.24% |
+| BaronMouse | 1,886 | 14,861 | 13 | 0.983 | scBiGNN | 0.958 ± 0.006 | ▼ 2.54% |
+| AMB | 12,832 | 42,625 | 22 | 0.994 | scBiGNN | 0.989 ± 0.001 | ▼ 0.51% |
+| Segerstolpe | 2,133 | 22,757 | 13 | 0.886 | ACTINN | **0.969 ± 0.005** | ▲ 8.26% |
+| Muraro | 2,122 | 18,915 | 9 | 0.962 | ACTINN | 0.976 ± 0.008 | ▲ 1.35% |
+
+PRISM beats the published baseline on 4 of 7 datasets, most notably Zheng68K (+7.89pp)
+and Segerstolpe (+8.26pp), and stays within ~0.5–4.5pp on the other 3. One caveat:
+BaronMouse's accuracy (0.958) looks solid but per-fold macro-F1 was much lower
+(0.55–0.76) — some rare classes are doing poorly despite a good overall accuracy
+number, worth a closer look before reading that row as an unqualified near-match.
 
 Notes:
 - The 5 scBiGNN baselines are verified exact matches against Ma et al.'s scBiGNN paper
