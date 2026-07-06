@@ -11,20 +11,25 @@ are instant. Falls back to a co-expression graph if STRING is unreachable.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import numpy as np
 import torch
 
 SPECIAL_TOKENS = 3  # [PAD], [CLS], [MASK]
 STRING_API = "https://string-db.org/api/tsv/network"
-STRING_SPECIES = 9606  # Homo sapiens
+STRING_SPECIES_HUMAN = 9606
+STRING_SPECIES_MOUSE = 10090
+STRING_SPECIES = STRING_SPECIES_HUMAN  # default; pass species= explicitly for non-human datasets
 
 
 # ---------------------------------------------------------------------------
 # STRING fetch
 # ---------------------------------------------------------------------------
 
-def _fetch_string(gene_names: list[str], min_score: int, cache_path: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def _fetch_string(
+    gene_names: list[str], min_score: int, cache_path: str, species: int = STRING_SPECIES,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
     Returns (src, dst, weight) numpy arrays for edges between gene_names.
     Results are cached to cache_path as a .npz file.
@@ -34,7 +39,7 @@ def _fetch_string(gene_names: list[str], min_score: int, cache_path: str) -> tup
         print(f"Loaded STRING graph from cache ({data['src'].shape[0]} edges).")
         return data["src"], data["dst"], data["weight"]
 
-    print("Fetching STRING PPI network (this may take ~30s)...")
+    print(f"Fetching STRING PPI network (species={species}, this may take ~30s)...")
     try:
         import requests
     except ImportError:
@@ -47,7 +52,7 @@ def _fetch_string(gene_names: list[str], min_score: int, cache_path: str) -> tup
         STRING_API,
         data={
             "identifiers": "\r".join(gene_names),
-            "species": STRING_SPECIES,
+            "species": species,
             "required_score": min_score,
             "caller_identity": "prism_portfolio",
         },
@@ -148,6 +153,7 @@ def build_gene_graph(
     cache_dir: str,
     min_score: int = 700,
     processed_path: str | None = None,
+    species: int = STRING_SPECIES,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Returns (edge_index, edge_weight) tensors for the gene PPI graph.
@@ -157,12 +163,19 @@ def build_gene_graph(
 
     Gene indices are 0-based (NOT offset by SPECIAL_TOKENS).
     The caller is responsible for the token offset when embedding.
+
+    Cache filename is content-addressed (hash of the exact gene list + species),
+    not just keyed by cache_dir/min_score — callers that share one cache_dir
+    across different gene panels (e.g. benchmark_eval.py, where every dataset's
+    processed .h5ad lives in the same directory) would otherwise silently load
+    a different dataset's PPI graph instead of refetching for their own genes.
     """
-    cache_path = os.path.join(cache_dir, f"string_graph_score{min_score}.npz")
+    gene_hash = hashlib.md5((str(species) + ",".join(gene_names)).encode()).hexdigest()[:10]
+    cache_path = os.path.join(cache_dir, f"string_graph_score{min_score}_{gene_hash}.npz")
     n_genes = len(gene_names)
 
     try:
-        src, dst, weight = _fetch_string(gene_names, min_score, cache_path)
+        src, dst, weight = _fetch_string(gene_names, min_score, cache_path, species=species)
     except Exception as e:
         print(f"STRING fetch failed ({e}). Using co-expression fallback.")
         if processed_path is None:

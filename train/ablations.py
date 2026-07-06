@@ -38,6 +38,12 @@ OUT_DIR = os.path.join(ROOT, "experiments", "ablations")
 CACHE_DIR = os.path.join(OUT_DIR, "cache")
 NO_CKPT = os.path.join(CACHE_DIR, "__no_checkpoint__.pt")  # deliberately never created
 
+# Repeats per config, varying only PretrainConfig.seed/FinetuneConfig.seed (model
+# init + data shuffling) — DataConfig.seed stays fixed at its default so every
+# seed sees the exact same train/val/test split. Distinguishes real effects from
+# single-run noise (several ablation deltas here are 1-4 points on 264 test cells).
+SEEDS = [42, 123, 7]
+
 
 def _get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -56,9 +62,11 @@ def _hash_key(*parts: dict) -> str:
 # Cached pretrain / finetune
 # ---------------------------------------------------------------------------
 
-def cached_pretrain(data_cfg: DataConfig, model_cfg: ModelConfig, epochs: int = 30) -> tuple[str, dict]:
+def cached_pretrain(
+    data_cfg: DataConfig, model_cfg: ModelConfig, epochs: int = 30, seed: int = 42,
+) -> tuple[str, dict]:
     """Returns (pretrain_ckpt_path, history). Skips training if a cached run exists."""
-    key = _hash_key(asdict(data_cfg), asdict(model_cfg), {"epochs": epochs, "stage": "pretrain"})
+    key = _hash_key(asdict(data_cfg), asdict(model_cfg), {"epochs": epochs, "seed": seed, "stage": "pretrain"})
     run_dir = os.path.join(CACHE_DIR, key)
     ckpt_path = os.path.join(run_dir, "pretrain_best.pt")
     history_path = os.path.join(run_dir, "pretrain_history.npy")
@@ -68,7 +76,7 @@ def cached_pretrain(data_cfg: DataConfig, model_cfg: ModelConfig, epochs: int = 
         return ckpt_path, np.load(history_path, allow_pickle=True).item()
 
     print(f"  [cache miss] pretrain {key} -> {run_dir}")
-    cfg = PretrainConfig(checkpoint_dir=run_dir, best_ckpt=ckpt_path, epochs=epochs)
+    cfg = PretrainConfig(checkpoint_dir=run_dir, best_ckpt=ckpt_path, epochs=epochs, seed=seed)
     pretrain(data_cfg=data_cfg, model_cfg=model_cfg, cfg=cfg)
     history = np.load(history_path, allow_pickle=True).item()
     return ckpt_path, history
@@ -81,13 +89,14 @@ def cached_finetune(
     freeze_encoder: str = "none",
     freeze_layers: int = 2,
     epochs: int = 15,
+    seed: int = 42,
 ) -> dict:
     """Returns test metrics dict (accuracy, macro_f1, ...). Skips training if cached."""
     key = _hash_key(
         {"pretrain_ckpt": pretrain_ckpt or "scratch"},
         asdict(data_cfg), asdict(model_cfg),
         {"freeze_encoder": freeze_encoder, "freeze_layers": freeze_layers,
-         "epochs": epochs, "stage": "finetune"},
+         "epochs": epochs, "seed": seed, "stage": "finetune"},
     )
     run_dir = os.path.join(CACHE_DIR, key)
     metrics_path = os.path.join(run_dir, "test_metrics.json")
@@ -106,6 +115,7 @@ def cached_finetune(
         freeze_encoder=freeze_encoder,
         freeze_layers=freeze_layers,
         epochs=epochs,
+        seed=seed,
     )
     _, _, metrics = finetune(data_cfg=data_cfg, model_cfg=model_cfg, cfg=cfg)
     serializable = {
@@ -115,6 +125,60 @@ def cached_finetune(
     with open(metrics_path, "w") as f:
         json.dump(serializable, f)
     return serializable
+
+
+def _mean_std(values: list[float]) -> tuple[float, float]:
+    arr = np.array(values, dtype=float)
+    return float(arr.mean()), float(arr.std())
+
+
+def multi_seed_run(
+    data_cfg: DataConfig,
+    model_cfg: ModelConfig,
+    device: torch.device,
+    freeze_encoder: str = "none",
+    freeze_layers: int = 2,
+    scratch: bool = False,
+    want_silhouette: bool = True,
+) -> dict:
+    """
+    Repeats pretrain+finetune (and optionally silhouette) across SEEDS, varying
+    only the training seed — same data split every time. Returns per-metric
+    mean/std plus the raw per-seed values for transparency.
+    """
+    accs, f1s, sils, val_losses = [], [], [], []
+    for seed in SEEDS:
+        ckpt = None
+        if not scratch:
+            ckpt, history = cached_pretrain(data_cfg, model_cfg, seed=seed)
+            val_losses.append(min(history["val_loss"]))
+        metrics = cached_finetune(
+            ckpt, data_cfg, model_cfg,
+            freeze_encoder=freeze_encoder, freeze_layers=freeze_layers, seed=seed,
+        )
+        accs.append(metrics["accuracy"])
+        f1s.append(metrics["macro_f1"])
+        if want_silhouette and ckpt is not None:
+            sils.append(embedding_silhouette(ckpt, data_cfg, model_cfg, device))
+
+    acc_mean, acc_std = _mean_std(accs)
+    f1_mean, f1_std = _mean_std(f1s)
+    out = {
+        "test_accuracy_mean": acc_mean, "test_accuracy_std": acc_std,
+        "test_macro_f1_mean": f1_mean, "test_macro_f1_std": f1_std,
+        "test_accuracy_seeds": accs, "test_macro_f1_seeds": f1s,
+    }
+    if sils:
+        sil_mean, sil_std = _mean_std(sils)
+        out["umap_silhouette_mean"] = sil_mean
+        out["umap_silhouette_std"] = sil_std
+        out["umap_silhouette_seeds"] = sils
+    if val_losses:
+        vl_mean, vl_std = _mean_std(val_losses)
+        out["val_loss_mean"] = vl_mean
+        out["val_loss_std"] = vl_std
+        out["val_loss_seeds"] = val_losses
+    return out
 
 
 def embedding_silhouette(pretrain_ckpt: str, data_cfg: DataConfig, model_cfg: ModelConfig, device: torch.device) -> float:
@@ -160,14 +224,8 @@ def experiment_masking_ratio(device: torch.device) -> list[dict]:
         print(f"\n-- masking_ratio={mask_ratio} --")
         data_cfg = DataConfig(mask_ratio=mask_ratio)
         model_cfg = ModelConfig()
-        ckpt, history = cached_pretrain(data_cfg, model_cfg)
-        metrics = cached_finetune(ckpt, data_cfg, model_cfg)
-        results.append({
-            "mask_ratio": mask_ratio,
-            "val_loss": min(history["val_loss"]),
-            "test_macro_f1": metrics["macro_f1"],
-            "test_accuracy": metrics["accuracy"],
-        })
+        agg = multi_seed_run(data_cfg, model_cfg, device, want_silhouette=False)
+        results.append({"mask_ratio": mask_ratio, **agg})
     return results
 
 
@@ -177,12 +235,17 @@ def experiment_tokenization(device: torch.device) -> list[dict]:
         print(f"\n-- tokenization={tokenization} --")
         data_cfg = DataConfig(tokenization=tokenization)
         model_cfg = ModelConfig()
-        ckpt, history = cached_pretrain(data_cfg, model_cfg)
-        silhouette = embedding_silhouette(ckpt, data_cfg, model_cfg, device)
+        accs, f1s, sils, val_losses = [], [], [], []
+        for seed in SEEDS:
+            ckpt, history = cached_pretrain(data_cfg, model_cfg, seed=seed)
+            val_losses.append(min(history["val_loss"]))
+            sils.append(embedding_silhouette(ckpt, data_cfg, model_cfg, device))
+        vl_mean, vl_std = _mean_std(val_losses)
+        sil_mean, sil_std = _mean_std(sils)
         results.append({
             "tokenization": tokenization,
-            "val_loss": min(history["val_loss"]),
-            "umap_silhouette": silhouette,
+            "val_loss_mean": vl_mean, "val_loss_std": vl_std, "val_loss_seeds": val_losses,
+            "umap_silhouette_mean": sil_mean, "umap_silhouette_std": sil_std, "umap_silhouette_seeds": sils,
         })
     return results
 
@@ -193,39 +256,32 @@ def experiment_model_depth(device: torch.device) -> list[dict]:
         print(f"\n-- num_layers={num_layers} --")
         data_cfg = DataConfig()
         model_cfg = ModelConfig(num_layers=num_layers)
-        ckpt, history = cached_pretrain(data_cfg, model_cfg)
-        metrics = cached_finetune(ckpt, data_cfg, model_cfg)
-        results.append({
-            "num_layers": num_layers,
-            "val_loss": min(history["val_loss"]),
-            "test_accuracy": metrics["accuracy"],
-        })
+        agg = multi_seed_run(data_cfg, model_cfg, device, want_silhouette=False)
+        results.append({"num_layers": num_layers, **agg})
     return results
 
 
 def experiment_pretrain_vs_scratch(device: torch.device) -> list[dict]:
     data_cfg = DataConfig()
     model_cfg = ModelConfig()
-    ckpt, _ = cached_pretrain(data_cfg, model_cfg)
 
     results = []
-    for label, use_ckpt in [("pretrained", ckpt), ("scratch", None)]:
+    for label, scratch in [("pretrained", False), ("scratch", True)]:
         print(f"\n-- pretrain_vs_scratch={label} --")
-        metrics = cached_finetune(use_ckpt, data_cfg, model_cfg)
-        results.append({"condition": label, "test_accuracy": metrics["accuracy"]})
+        agg = multi_seed_run(data_cfg, model_cfg, device, scratch=scratch, want_silhouette=False)
+        results.append({"condition": label, **agg})
     return results
 
 
 def experiment_freeze_vs_finetune(device: torch.device) -> list[dict]:
     data_cfg = DataConfig()
     model_cfg = ModelConfig()
-    ckpt, _ = cached_pretrain(data_cfg, model_cfg)
 
     results = []
     for freeze in ["none", "full"]:
         print(f"\n-- freeze_encoder={freeze} --")
-        metrics = cached_finetune(ckpt, data_cfg, model_cfg, freeze_encoder=freeze)
-        results.append({"freeze_encoder": freeze, "test_accuracy": metrics["accuracy"]})
+        agg = multi_seed_run(data_cfg, model_cfg, device, freeze_encoder=freeze, want_silhouette=False)
+        results.append({"freeze_encoder": freeze, **agg})
     return results
 
 
@@ -239,14 +295,8 @@ def experiment_gene_embeddings(device: torch.device) -> list[dict]:
     results = []
     for label, model_cfg in conditions:
         print(f"\n-- gene_embeddings={label} --")
-        ckpt, _ = cached_pretrain(data_cfg, model_cfg)
-        metrics = cached_finetune(ckpt, data_cfg, model_cfg)
-        silhouette = embedding_silhouette(ckpt, data_cfg, model_cfg, device)
-        results.append({
-            "condition": label,
-            "test_accuracy": metrics["accuracy"],
-            "umap_silhouette": silhouette,
-        })
+        agg = multi_seed_run(data_cfg, model_cfg, device, want_silhouette=True)
+        results.append({"condition": label, **agg})
     return results
 
 
@@ -257,35 +307,27 @@ def experiment_gnn_depth(device: torch.device) -> list[dict]:
     Motivated by the GNN-in-single-cell-omics review's central caution that
     "increasing the number of layers exacerbates over-smoothing, where node
     representations become overly similar." 2 layers is GeneGAT's default and
-    matches gene_embeddings' "gnn_joint" condition, so that pretrain/finetune
-    pair is reused rather than recomputed.
+    matches gene_embeddings' "gnn_joint" condition, so those pretrain/finetune
+    runs are reused rather than recomputed.
     """
     data_cfg = DataConfig()
     results = []
     for gnn_layers in [1, 2, 3]:
         print(f"\n-- gnn_depth={gnn_layers} --")
         model_cfg = ModelConfig(use_gnn=True, gnn_freeze=False, gnn_layers=gnn_layers)
-        ckpt, _ = cached_pretrain(data_cfg, model_cfg)
-        metrics = cached_finetune(ckpt, data_cfg, model_cfg)
-        silhouette = embedding_silhouette(ckpt, data_cfg, model_cfg, device)
-        results.append({
-            "gnn_layers": gnn_layers,
-            "test_accuracy": metrics["accuracy"],
-            "umap_silhouette": silhouette,
-        })
+        agg = multi_seed_run(data_cfg, model_cfg, device, want_silhouette=True)
+        results.append({"gnn_layers": gnn_layers, **agg})
     return results
 
 
 def experiment_classification_head(device: torch.device) -> list[dict]:
     data_cfg = DataConfig()
-    model_cfg = ModelConfig()
-    ckpt, _ = cached_pretrain(data_cfg, model_cfg)
 
     results = []
     for label, head_model_cfg in [("cls", ModelConfig()), ("gat", ModelConfig(use_gat_head=True))]:
         print(f"\n-- classification_head={label} --")
-        metrics = cached_finetune(ckpt, data_cfg, head_model_cfg)
-        results.append({"head": label, "test_accuracy": metrics["accuracy"]})
+        agg = multi_seed_run(data_cfg, head_model_cfg, device, want_silhouette=False)
+        results.append({"head": label, **agg})
     return results
 
 
@@ -306,17 +348,34 @@ EXPERIMENTS = {
 # ---------------------------------------------------------------------------
 
 def write_summary(all_results: dict[str, list[dict]]) -> str:
-    lines = ["# Ablation Results\n"]
+    """
+    Renders each *_mean/*_std pair as a single "mean ± std" column and drops
+    the raw *_seeds lists (still in results.json, just not the summary table).
+    """
+    lines = ["# Ablation Results\n", f"Each cell is mean ± std across {len(SEEDS)} seeds ({SEEDS}).\n"]
     for name, rows in all_results.items():
         lines.append(f"## {name}\n")
         if not rows:
             lines.append("(no results)\n")
             continue
-        cols = list(rows[0].keys())
+        all_keys = list(rows[0].keys())
+        seed_keys = {k for k in all_keys if k.endswith("_seeds")}
+        mean_keys = [k[:-5] for k in all_keys if k.endswith("_mean")]
+        plain_keys = [k for k in all_keys if k not in seed_keys
+                      and not k.endswith("_mean") and not k.endswith("_std")]
+        cols = plain_keys + mean_keys
         lines.append("| " + " | ".join(cols) + " |")
         lines.append("|" + "---|" * len(cols))
         for row in rows:
-            vals = [f"{row[c]:.4f}" if isinstance(row[c], float) else str(row[c]) for c in cols]
+            vals = []
+            for c in plain_keys:
+                v = row[c]
+                vals.append(f"{v:.4f}" if isinstance(v, float) else str(v))
+            for c in mean_keys:
+                if f"{c}_mean" in row:
+                    vals.append(f"{row[f'{c}_mean']:.4f} ± {row[f'{c}_std']:.4f}")
+                else:
+                    vals.append("—")
             lines.append("| " + " | ".join(vals) + " |")
         lines.append("")
     report = "\n".join(lines)

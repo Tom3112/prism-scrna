@@ -70,12 +70,17 @@ def compute_metrics(
     acc = accuracy_score(labels, preds)
     macro_f1 = f1_score(labels, preds, labels=all_labels, average="macro", zero_division=0)
     per_class_f1 = f1_score(labels, preds, labels=all_labels, average=None, zero_division=0)
+    # Median (not mean) of per-class F1 — the metric Abdelaal et al. 2019 (source
+    # of this benchmark suite) use as their primary score specifically because it's
+    # robust to one or two badly-performing rare classes dragging down a macro-average.
+    median_f1 = float(np.median(per_class_f1))
     cm = confusion_matrix(labels, preds, labels=all_labels)
     report = classification_report(labels, preds, labels=all_labels, target_names=label_names, zero_division=0)
 
     return {
         "accuracy": acc,
         "macro_f1": macro_f1,
+        "median_f1": median_f1,
         "per_class_f1": per_class_f1,
         "confusion_matrix": cm,
         "classification_report": report,

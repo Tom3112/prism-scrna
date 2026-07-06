@@ -133,33 +133,62 @@ uv run python train/benchmark_eval.py --dataset BaronHuman --epochs 20
 ## Benchmarks
 
 7 datasets, all from the Abdelaal et al. 2019 Zenodo archive (3357167), evaluated via
-`train/benchmark_eval.py` (5-fold CV, CLS head, from-scratch supervised training —
-no MGP pretraining transfer, matching how scBiGNN/ACTINN themselves are evaluated).
-All 7 verified: both their presence in that exact archive (confirmed by listing its
-full contents directly) and their baseline numbers against the cited paper.
+`train/benchmark_eval.py` (5-fold CV, from-scratch supervised training — no MGP
+pretraining transfer, matching how scBiGNN/ACTINN themselves are evaluated). All 7
+verified: both their presence in that exact archive (confirmed by listing its full
+contents directly) and their baseline numbers against the cited paper.
 
-| Dataset | Cells | Genes | Types | Baseline | Method | **PRISM (ours)** | Δ |
+**Architecture used below: plain PRISM baseline only** — no GNN component at all
+(`use_gnn=False`, `use_gat_head=False`), CLS linear head. Neither GeneGAT (Option A,
+gene embeddings) nor CellGAT (Option B, GNN-as-classifier) are exercised here yet;
+see Next Steps.
+
+**Metrics — not all one type, read the Method column:**
+- **scBiGNN** rows: baseline is **accuracy** (Ma et al.'s Table 2 reports accuracy only,
+  no F1 anywhere in that paper) — PRISM's accuracy is the right comparison here.
+- **ACTINN** rows: baseline is very likely **median F1** (Abdelaal et al. 2019's entire
+  evaluation framework is built around median-F1-score as its primary metric; the
+  specific 0.886/0.962 values do not appear verbatim anywhere in that paper's main
+  text, so we can't confirm their exact source, but everything else in the paper
+  points to median F1, not accuracy). Comparing PRISM's *accuracy* against a
+  *median-F1* baseline would be apples-to-oranges, so both PRISM metrics are given
+  for these two rows — treat the accuracy delta as unverified pending confirming
+  the baseline's exact metric type.
+- **median F1** here means the median (not mean) of per-class F1 scores — robust to
+  one or two badly-performing rare classes dragging down a macro-average, which is
+  exactly why Abdelaal et al. use it instead of accuracy or macro-F1.
+
+| Dataset | Cells | Types | Baseline | Method | PRISM accuracy | PRISM median F1 | Δ (accuracy) |
 |---|---|---|---|---|---|---|---|
-| Zheng68K | 65,943 | 20,387 | 11 | 0.760 | scBiGNN | **0.839 ± 0.002** | ▲ 7.89% |
-| Zhengsorted | 20,000 | 21,952 | 10 | 0.867 | scBiGNN | 0.822 ± 0.003 | ▼ 4.54% |
-| BaronHuman | 8,569 | 17,499 | 14 | 0.983 | scBiGNN | 0.985 ± 0.002 | ▲ 0.24% |
-| BaronMouse | 1,886 | 14,861 | 13 | 0.983 | scBiGNN | 0.958 ± 0.006 | ▼ 2.54% |
-| AMB | 12,832 | 42,625 | 22 | 0.994 | scBiGNN | 0.989 ± 0.001 | ▼ 0.51% |
-| Segerstolpe | 2,133 | 22,757 | 13 | 0.886 | ACTINN | **0.969 ± 0.005** | ▲ 8.26% |
-| Muraro | 2,122 | 18,915 | 9 | 0.962 | ACTINN | 0.976 ± 0.008 | ▲ 1.35% |
+| Zheng68K | 65,943 | 11 | 0.760 (acc) | scBiGNN | **0.839 ± 0.002** | — | ▲ 7.89% |
+| Zhengsorted | 20,000 | 10 | 0.867 (acc) | scBiGNN | 0.822 ± 0.003 | — | ▼ 4.54% |
+| BaronHuman | 8,569 | 14 | 0.983 (acc) | scBiGNN | 0.985 ± 0.002 | — | ▲ 0.24% |
+| BaronMouse | 1,886 | 13 | 0.983 (acc) | scBiGNN | 0.958 ± 0.006 | — | ▼ 2.54% |
+| AMB | 12,832 | 22 | 0.994 (acc) | scBiGNN | 0.989 ± 0.001 | — | ▼ 0.51% |
+| Segerstolpe | 2,133 | 13 | 0.886 (metric unconfirmed) | ACTINN | 0.969 ± 0.005 | — | unverified basis |
+| Muraro | 2,122 | 9 | 0.962 (metric unconfirmed) | ACTINN | 0.976 ± 0.008 | — | unverified basis |
 
-PRISM beats the published baseline on 4 of 7 datasets, most notably Zheng68K (+7.89pp)
-and Segerstolpe (+8.26pp), and stays within ~0.5–4.5pp on the other 3. One caveat:
-BaronMouse's accuracy (0.958) looks solid but per-fold macro-F1 was much lower
-(0.55–0.76) — some rare classes are doing poorly despite a good overall accuracy
-number, worth a closer look before reading that row as an unqualified near-match.
+*(Median F1 column being backfilled — added to `eval/metrics.py` after this table was
+first generated; a rerun with it populated is in progress.)*
+
+Among the 5 scBiGNN rows (the ones with an unambiguous, verified accuracy baseline),
+PRISM beats it on 2 of 5 (Zheng68K +7.89pp, BaronHuman +0.24pp) and trails on 3
+(Zhengsorted, BaronMouse, AMB), all within ~0.5–4.5pp. One caveat: BaronMouse's
+accuracy (0.958) looks solid but per-fold macro-F1 was much lower (0.55–0.76) — a
+per-class breakdown shows the 5 largest classes (91% of the dataset) all score
+F1 ≥ 0.90, while the smallest classes do badly (schwann, 6 cells, F1 = 0.000;
+T_cell, 7 cells, F1 = 0.25) — classic class-imbalance masking, the same failure
+mode Abdelaal et al.'s median-F1 choice is designed to catch. The 2 ACTINN rows
+can't be confidently read as beating or losing to baseline until the metric-type
+question above is resolved.
 
 Notes:
 - The 5 scBiGNN baselines are verified exact matches against Ma et al.'s scBiGNN paper
   (arXiv:2312.10310, Table 2). Segerstolpe and Muraro's cell/type counts are corrected
   here against Abdelaal et al. 2019's actual Table 2 (previously listed as ~2,300/14 and
-  ~2,100/9); their ACTINN accuracy values are as originally recorded in this repo and
-  have not been independently re-derived from the source figure.
+  ~2,100/9); their ACTINN values are as originally recorded in this repo, unconfirmed
+  against the source figure, and — per the metrics note above — possibly a different
+  metric (median F1) than what's being compared against (accuracy).
 - **Zeisel, Macosko, and Klein were previously listed here** (attributed to "Abdelaal
   et al. 2019 (Zenodo 3357167)") but don't actually exist anywhere in that Zenodo
   archive — confirmed by listing its full directory contents (`Inter-dataset/`,
@@ -260,12 +289,12 @@ prism/
 
 ## References
 
-- **Geneformer** — Theodoris et al., *Nature* 2023. Rank-based gene tokenization.
-- **scGPT** — Cui et al., *Nature Methods* 2024. Generative pretraining on scRNA.
-- **scBERT** — Yang et al., *Nature Machine Intelligence* 2022. BERT for scRNA.
-- **scBiGNN** — Ma et al., 2023. Bipartite GNN for cell-type annotation (direct baseline).
-- **ACTINN** — Ma & Pellegrini, *Bioinformatics* 36(2):533–538, 2020. Supervised neural network baseline.
-- **STRING** — Szklarczyk et al., *Nucleic Acids Research* 2023. PPI network.
-- **GAT** — Velickovic et al., *ICLR* 2018. Graph Attention Networks.
-- **GNNs for single-cell omics** — Li, Hua & Chen, *Briefings in Bioinformatics* 26(2):bbaf109, 2025. Review of GNN approaches across single-cell omics; the actual source for PRISM's GeneGAT/CellGAT design (PPI-informed gene embeddings, GAT-based classification) and for the GNN-depth ablation's over-smoothing motivation — not the original project brief, which specified a plain transformer only.
-- **Abdelaal et al.** — *Genome Biology* 2019. Benchmark suite (Zenodo 3357167).
+- **Geneformer** — Theodoris et al., "Transfer learning enables predictions in network biology," *Nature* 618:616–624, 2023. Rank-based gene tokenization. [doi.org/10.1038/s41586-023-06139-9](https://doi.org/10.1038/s41586-023-06139-9)
+- **scGPT** — Cui et al., "scGPT: toward building a foundation model for single-cell multi-omics using generative AI," *Nature Methods*, 2024. Generative pretraining on scRNA. [doi.org/10.1038/s41592-024-02201-0](https://doi.org/10.1038/s41592-024-02201-0)
+- **scBERT** — Yang et al., "scBERT as a large-scale pretrained deep language model for cell type annotation of single-cell RNA-seq data," *Nature Machine Intelligence* 4, 2022. BERT for scRNA. [doi.org/10.1038/s42256-022-00534-z](https://doi.org/10.1038/s42256-022-00534-z)
+- **scBiGNN** — Ma et al., "scBiGNN: Bilevel Graph Representation Learning for Cell Type Classification from Single-cell RNA Sequencing Data," 2023. Bipartite GNN for cell-type annotation (direct baseline). [arxiv.org/abs/2312.10310](https://arxiv.org/abs/2312.10310)
+- **ACTINN** — Ma & Pellegrini, "ACTINN: automated identification of cell types in single cell RNA sequencing," *Bioinformatics* 36(2):533–538, 2020. Supervised neural network baseline. [doi.org/10.1093/bioinformatics/btz592](https://doi.org/10.1093/bioinformatics/btz592)
+- **STRING** — Szklarczyk et al., "The STRING database in 2023: protein-protein association networks and functional enrichment analyses for any sequenced genome of interest," *Nucleic Acids Research* 51(D1):D638–D646, 2023. PPI network. [doi.org/10.1093/nar/gkac1000](https://doi.org/10.1093/nar/gkac1000)
+- **GAT** — Veličković et al., "Graph Attention Networks," *ICLR* 2018. [arxiv.org/abs/1710.10903](https://arxiv.org/abs/1710.10903)
+- **GNNs for single-cell omics** — Li, Hua & Chen, "Graph neural networks for single-cell omics data: a review of approaches and applications," *Briefings in Bioinformatics* 26(2):bbaf109, 2025. The actual source for PRISM's GeneGAT/CellGAT design (PPI-informed gene embeddings, GAT-based classification) and for the GNN-depth ablation's over-smoothing motivation — not the original project brief, which specified a plain transformer only. [doi.org/10.1093/bib/bbaf109](https://doi.org/10.1093/bib/bbaf109)
+- **Abdelaal et al.** — "A comparison of automatic cell identification methods for single-cell RNA sequencing data," *Genome Biology* 20:194, 2019. Benchmark suite (Zenodo 3357167). [doi.org/10.1186/s13059-019-1795-z](https://doi.org/10.1186/s13059-019-1795-z)

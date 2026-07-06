@@ -187,14 +187,17 @@ def build_gene_gat(
     model_cfg,
     processed_path: str,
     device: torch.device,
+    species: int = 9606,
 ) -> GeneGAT:
     """
     Builds a GeneGAT wired to the STRING PPI graph for the genes in
     `processed_path`, using the GNN-related fields of ModelConfig (hidden_dim,
     gnn_layers, gnn_heads, gnn_freeze, string_min_score). Shared by
-    pretrain.py, finetune.py, and ablations.py so all three construct an
-    identical architecture (required to load a checkpoint trained with
-    use_gnn=True).
+    pretrain.py, finetune.py, ablations.py, and benchmark_eval.py so all
+    construct an identical architecture (required to load a checkpoint trained
+    with use_gnn=True). species=9606 (human) default; pass 10090 for mouse
+    datasets (BaronMouse, AMB) — STRING won't match mouse gene symbols against
+    the human network.
 
     Reads gene names directly (backed mode — skips loading the expression
     matrix) rather than requiring the caller to have already loaded the adata.
@@ -209,6 +212,7 @@ def build_gene_gat(
         cache_dir=os.path.dirname(processed_path),
         min_score=model_cfg.string_min_score,
         processed_path=processed_path,
+        species=species,
     )
     return GeneGAT(
         n_genes=len(gene_names),

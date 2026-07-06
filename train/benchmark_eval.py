@@ -25,10 +25,15 @@ Compares our model against published baselines:
   Klein        |    —     |    —     |  ?
 
 Usage:
-    uv run python train/benchmark_eval.py
+    uv run python train/benchmark_eval.py                    # plain baseline (no GNN)
     uv run python train/benchmark_eval.py --dataset BaronHuman
-    uv run python train/benchmark_eval.py --head gat   # use GNN-as-classifier
+    uv run python train/benchmark_eval.py --gnn frozen        # GeneGAT frozen (Option A)
+    uv run python train/benchmark_eval.py --gnn joint         # GeneGAT joint (Option A)
+    uv run python train/benchmark_eval.py --head gat          # CellGAT head (Option B)
     uv run python train/benchmark_eval.py --dataset Zeisel --epochs 20
+
+Results are saved per-variant to experiments/benchmark_results_<head>_<gnn>.npy so
+different --head/--gnn runs don't overwrite each other.
 """
 
 from __future__ import annotations
@@ -50,6 +55,7 @@ from data.dataset import scRNADataset
 from model.transformer import scRNAEncoder
 from model.heads import CellTypeClassificationHead, CellGATClassificationHead
 from model.gene_graph import build_gene_graph
+from model.gnn import build_gene_gat
 from train.config import DataConfig, ModelConfig, FinetuneConfig
 from train.pretrain import get_cosine_schedule_with_warmup
 from eval.metrics import collect_predictions, compute_metrics, _forward_head
@@ -77,6 +83,18 @@ BASELINES: dict[str, tuple[str, float]] = {
 # Keep old name as alias for backward compatibility
 SCBIGNN_BASELINE = {k: v for k, (_, v) in BASELINES.items() if _[0] == "scBiGNN"}
 
+# STRING species per dataset — BaronMouse and AMB are mouse; STRING won't match
+# mouse gene symbols against the human (9606) network, so PPI lookups for those
+# two would silently return near-empty graphs without this.
+STRING_SPECIES_BY_DATASET = {
+    "BaronMouse": 10090,  # Mus musculus
+    "AMB":        10090,  # Mus musculus
+}
+
+
+def _species_for(name: str) -> int:
+    return STRING_SPECIES_BY_DATASET.get(name, 9606)
+
 
 def _get_device() -> torch.device:
     if torch.cuda.is_available():
@@ -96,6 +114,7 @@ def train_one_fold(
     pretrain_ckpt: str | None,
     ppi_edge_index: torch.Tensor | None = None,
     ppi_edge_weight: torch.Tensor | None = None,
+    gene_gat=None,
 ) -> tuple[float, float]:
     """Train on one fold, return (accuracy, macro_f1)."""
 
@@ -127,6 +146,7 @@ def train_one_fold(
         ffn_dim=model_cfg.ffn_dim,
         dropout=model_cfg.dropout,
         max_seq_len=data_cfg.max_seq_len,
+        gene_gat=gene_gat,
     ).to(device)
 
     if pretrain_ckpt and os.path.exists(pretrain_ckpt):
@@ -182,7 +202,7 @@ def train_one_fold(
 
     preds, labels = collect_predictions(encoder, head, test_loader, device)
     metrics = compute_metrics(preds, labels, all_cats)
-    return metrics["accuracy"], metrics["macro_f1"]
+    return metrics["accuracy"], metrics["macro_f1"], metrics["median_f1"]
 
 
 def evaluate_dataset(
@@ -194,76 +214,98 @@ def evaluate_dataset(
     pretrain_ckpt: str | None,
     k: int = 5,
 ) -> dict:
+    gnn_label = "none"
+    if model_cfg.use_gnn:
+        gnn_label = "frozen" if model_cfg.gnn_freeze else "joint"
     print(f"\n{'='*60}")
-    print(f"Dataset: {name}  ({k}-fold CV)  head={'GAT' if model_cfg.use_gat_head else 'CLS'}")
+    print(f"Dataset: {name}  ({k}-fold CV)  head={'GAT' if model_cfg.use_gat_head else 'CLS'}  gnn={gnn_label}")
     print(f"{'='*60}")
 
-    adata  = load_benchmark(name)
-    splits = make_kfold_splits(adata, k=k)
+    adata   = load_benchmark(name)
+    splits  = make_kfold_splits(adata, k=k)
+    species = _species_for(name)
 
     # Build PPI graph once for the whole dataset (same HVGs across all folds)
     ppi_edge_index = ppi_edge_weight = None
     if model_cfg.use_gat_head:
         gene_names   = list(adata.var_names)
         ppi_cache_dir = os.path.join(BENCH_DIR, f"{name}_ppi")
-        print(f"  Building PPI graph for {len(gene_names)} genes …")
+        print(f"  Building PPI graph for {len(gene_names)} genes (species={species}) …")
         ppi_edge_index, ppi_edge_weight = build_gene_graph(
             gene_names,
             cache_dir=ppi_cache_dir,
             min_score=model_cfg.string_min_score,
+            species=species,
         )
 
-    fold_accs, fold_f1s = [], []
+    # GeneGAT (Option A) is trainable in joint mode, so it must be rebuilt fresh
+    # per fold — reusing one instance across folds would leak fold N's trained
+    # GAT weights into fold N+1, breaking CV independence. The underlying STRING
+    # edge_index/edge_weight are still disk-cached, so rebuilding the nn.Module
+    # wrapper each fold is cheap.
+    proc_path = None
+    if model_cfg.use_gnn:
+        proc_path = os.path.join(BENCH_DIR, BENCHMARK_FILES[name]).replace(".h5ad", "_processed.h5ad")
+
+    fold_accs, fold_f1s, fold_median_f1s = [], [], []
     for fold, (train_idx, test_idx) in enumerate(splits, 1):
         t0 = time.time()
         train_a = adata[train_idx].copy()
         test_a  = adata[test_idx].copy()
-        acc, f1 = train_one_fold(
+        gene_gat = None
+        if model_cfg.use_gnn:
+            gene_gat = build_gene_gat(model_cfg, proc_path, device, species=species)
+        acc, f1, median_f1 = train_one_fold(
             train_a, test_a, model_cfg, data_cfg, ft_cfg, device, pretrain_ckpt,
             ppi_edge_index=ppi_edge_index, ppi_edge_weight=ppi_edge_weight,
+            gene_gat=gene_gat,
         )
-        fold_accs.append(acc); fold_f1s.append(f1)
-        print(f"  Fold {fold}/{k}  acc={acc:.4f}  macro_f1={f1:.4f}  ({time.time()-t0:.1f}s)")
+        fold_accs.append(acc); fold_f1s.append(f1); fold_median_f1s.append(median_f1)
+        print(f"  Fold {fold}/{k}  acc={acc:.4f}  macro_f1={f1:.4f}  median_f1={median_f1:.4f}  ({time.time()-t0:.1f}s)")
 
     mean_acc = np.mean(fold_accs)
     std_acc  = np.std(fold_accs)
     mean_f1  = np.mean(fold_f1s)
+    mean_median_f1 = np.mean(fold_median_f1s)
 
     ref_method, ref_acc = BASELINES.get(name, (None, None))
     delta = mean_acc - ref_acc if ref_acc is not None else None
 
-    print(f"\n  Mean acc : {mean_acc:.4f} ± {std_acc:.4f}")
-    print(f"  Mean F1  : {mean_f1:.4f}")
+    print(f"\n  Mean acc       : {mean_acc:.4f} ± {std_acc:.4f}")
+    print(f"  Mean macro F1  : {mean_f1:.4f}")
+    print(f"  Mean median F1 : {mean_median_f1:.4f}  (Abdelaal et al. 2019's primary metric — robust to rare-class outliers)")
     if ref_acc is not None:
         sign = "▲" if delta > 0 else "▼"
         print(f"  vs {ref_method}: {sign} {abs(delta)*100:.2f}%  "
               f"({ref_acc:.4f} → {mean_acc:.4f})")
 
     return {
-        "dataset":    name,
-        "mean_acc":   mean_acc,
-        "std_acc":    std_acc,
-        "mean_f1":    mean_f1,
-        "fold_accs":  fold_accs,
-        "ref_method": ref_method,
-        "ref_acc":    ref_acc,
-        "delta":      delta,
+        "dataset":        name,
+        "mean_acc":       mean_acc,
+        "std_acc":        std_acc,
+        "mean_f1":        mean_f1,
+        "mean_median_f1": mean_median_f1,
+        "fold_accs":      fold_accs,
+        "fold_median_f1s": fold_median_f1s,
+        "ref_method":     ref_method,
+        "ref_acc":        ref_acc,
+        "delta":          delta,
     }
 
 
 def print_summary_table(results: list[dict]):
-    print(f"\n{'='*78}")
+    print(f"\n{'='*90}")
     print("BENCHMARK SUMMARY")
-    print(f"{'='*78}")
-    print(f"{'Dataset':<15} {'Ours (acc)':<18} {'Baseline':<10} {'Method':<12} {'Δ':>8}")
-    print("-" * 65)
+    print(f"{'='*90}")
+    print(f"{'Dataset':<15} {'Ours (acc)':<18} {'Median F1':<11} {'Baseline':<10} {'Method':<12} {'Δ':>8}")
+    print("-" * 78)
     for r in results:
         delta_str  = f"{r['delta']*100:+.2f}%" if r["delta"] is not None else "—"
         ref_str    = f"{r['ref_acc']:.3f}" if r["ref_acc"] is not None else "—"
         method_str = r["ref_method"] or "—"
         print(f"{r['dataset']:<15} {r['mean_acc']:.4f} ± {r['std_acc']:.4f}  "
-              f"{ref_str:<10} {method_str:<12} {delta_str:>8}")
-    print(f"{'='*78}")
+              f"{r['mean_median_f1']:<11.4f} {ref_str:<10} {method_str:<12} {delta_str:>8}")
+    print(f"{'='*90}")
 
 
 def main():
@@ -278,10 +320,16 @@ def main():
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--head", choices=["cls", "gat"], default="cls",
                         help="cls = [CLS] linear probe; gat = CellGAT (PPI graph during classification)")
+    parser.add_argument("--gnn", choices=["none", "frozen", "joint"], default="none",
+                        help="none = plain nn.Embedding; frozen/joint = GeneGAT gene embeddings (Option A)")
     args = parser.parse_args()
 
     device     = _get_device()
-    model_cfg  = ModelConfig(use_gat_head=(args.head == "gat"))
+    model_cfg  = ModelConfig(
+        use_gat_head=(args.head == "gat"),
+        use_gnn=(args.gnn != "none"),
+        gnn_freeze=(args.gnn == "frozen"),
+    )
     data_cfg   = DataConfig()
     ft_cfg     = FinetuneConfig(epochs=args.epochs)
 
@@ -301,8 +349,9 @@ def main():
 
     if results:
         print_summary_table(results)
+        variant = f"{args.head}_{args.gnn}"
         out = os.path.join(os.path.dirname(__file__), "..", "experiments",
-                           "benchmark_results.npy")
+                           f"benchmark_results_{variant}.npy")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         np.save(out, results)
         print(f"\nResults saved to {out}")
