@@ -234,6 +234,33 @@ Three clear patterns:
   fail on this dataset — the transformer's own representations carry the signal, and
   the GAT layer adds a task-relevant refinement rather than replacing the embedding.
 
+### Comparison against a cell-cell graph method: HNNVAT
+
+All 4 PRISM variants above only ever model **gene-gene** structure (STRING PPI).
+[HNNVAT](https://doi.org/10.1093/bioinformatics/btad043) (Wang et al., 2023) is a
+published method from the same class Option C ([CellGraphClassificationHead](#option-c--cellgraph-head-cell-cell-gnn))
+is modeled after — a **cell-cell** graph classifier, reporting on 5 of our exact 7
+benchmark datasets:
+
+| Dataset | PRISM best variant | HNNVAT | Δ |
+|---|---|---|---|
+| BaronHuman | 0.9856 (CellGAT) | 0.982 | ▲ 0.37pp |
+| BaronMouse | 0.9751 (CellGAT) | 0.989 | ▼ 1.39pp |
+| Zheng68K | 0.8429 (GNN joint) | 0.753 | ▲ 8.99pp |
+| Zhengsorted | 0.8210 (baseline) | **0.926** | **▼ 10.50pp** |
+| Muraro | 0.9779 (baseline) | 0.995 | ▼ 1.71pp |
+
+**Protocol caveat:** HNNVAT reports a single 80/10/10 train/val/test split; PRISM's
+numbers are 5-fold CV means — not a perfectly matched comparison, same caveat class
+as the scBiGNN/ACTINN rows above.
+
+**Zhengsorted stands out.** It's HNNVAT's best win by the widest margin, and it's the
+exact dataset where every gene-level PRISM variant plateaus around 0.82–0.84 (and
+GNN frozen/joint collapse to ~0.74–0.75). A real cell-cell graph method dominating
+specifically where PRISM's gene-level approaches struggle most is a concrete,
+evidence-backed reason to run Option C — currently only validated on PBMC 3k — on
+the benchmark suite, Zhengsorted first.
+
 Notes:
 - The 5 scBiGNN baselines are verified exact matches against Ma et al.'s scBiGNN paper
   (arXiv:2312.10310, Table 2) — confirmed accuracy (table caption), confirmed those 5
@@ -371,3 +398,4 @@ prism/
 - **GAT** — Veličković et al., "Graph Attention Networks," *ICLR* 2018. [arxiv.org/abs/1710.10903](https://arxiv.org/abs/1710.10903)
 - **GNNs for single-cell omics** — Li, Hua & Chen, "Graph neural networks for single-cell omics data: a review of approaches and applications," *Briefings in Bioinformatics* 26(2):bbaf109, 2025. The actual source for PRISM's GeneGAT/CellGAT design (PPI-informed gene embeddings, GAT-based classification) and for the GNN-depth ablation's over-smoothing motivation — not the original project brief, which specified a plain transformer only. [doi.org/10.1093/bib/bbaf109](https://doi.org/10.1093/bib/bbaf109)
 - **Abdelaal et al.** — "A comparison of automatic cell identification methods for single-cell RNA sequencing data," *Genome Biology* 20:194, 2019. Benchmark suite (Zenodo 3357167). [doi.org/10.1186/s13059-019-1795-z](https://doi.org/10.1186/s13059-019-1795-z)
+- **HNNVAT** — Wang et al., "Adversarial dense graph convolutional networks for single-cell classification," *Bioinformatics* 39(2):btad043, 2023. Cell-cell graph classifier — the direct comparison point for PRISM's Option C. [doi.org/10.1093/bioinformatics/btad043](https://doi.org/10.1093/bioinformatics/btad043)
