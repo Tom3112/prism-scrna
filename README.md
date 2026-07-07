@@ -92,6 +92,22 @@ the `[CLS]` token, gene hidden states from the transformer are:
 
 Enable with `--head gat` in `benchmark_eval.py` or `ModelConfig(use_gat_head=True)`.
 
+### Option C — CellGraph head (cell-cell GNN)
+Options A and B both only ever model **gene-gene** structure — no PRISM variant
+modeled **cell-cell** structure until this one, which is what scBiGNN's *bilevel*
+design actually does (a gene-level GNN *and* a cell-level GNN, trained jointly via
+EM). This is a cheaper approximation of that second half: a k-NN graph built from
+cosine similarity between cell `[CLS]` embeddings **within the current training
+batch** (not the full dataset — that would need an EM loop like scBiGNN's, which
+this doesn't implement), refined by one GATConv layer, then classified.
+
+Enable with `ModelConfig(use_cell_graph=True)` (`cell_graph_k` controls neighbors
+per cell, default 5). First result (PBMC 3k, 3 seeds): beats the plain CLS head on
+macro F1 (0.823 ± 0.021 vs 0.779 ± 0.072, tighter std too) but doesn't beat CellGAT
+(0.847 ± 0.007) — Option B's gene-level PPI graph remains the strongest single
+classification-time addition. See [Ablation Experiments](#ablation-experiments)
+below for the full comparison.
+
 ---
 
 ## Quick Start
@@ -264,8 +280,8 @@ model init + data shuffling only, not the train/val/test split itself); see
 | Pretrain vs scratch | Pretrained encoder vs random init | Test accuracy | Scratch (**0.914 ± 0.005**) still edges out pretrained (0.909 ± 0.011) — confirmed across 3 seeds, not a single-run fluke; MGP pretraining still isn't earning its cost on a dataset this small |
 | Freeze vs fine-tune | Frozen encoder vs full fine-tune | Test accuracy, macro F1 | Full fine-tune **0.909 ± 0.011** vs frozen 0.597 ± 0.002 (macro F1 0.779 vs 0.194) — the tightest std of any result here (frozen's failure is consistent, not noisy) and by far the most decisive finding in the whole ablation suite |
 | Gene embeddings | Baseline vs GNN frozen vs GNN joint | Test accuracy, macro F1, UMAP | GNN joint now **wins clearly**: accuracy 0.913 vs baseline 0.909, macro F1 0.799 vs 0.779, and silhouette 0.061 ± 0.039 vs baseline's -0.101 ± 0.020 — non-overlapping ranges. Frozen is worse on every metric (0.865 acc, 0.624 macro F1). **This reverses the single-run "did not replicate" verdict** — the joint-training embedding edge is real, just too small to see without averaging over seeds |
-| GNN depth | GeneGAT at 1 / 2 / 3 layers (joint) | Test accuracy, macro F1, UMAP | Now a clean, consistent split: accuracy and macro F1 both fall monotonically with depth (0.918→0.913→0.905; 0.823→0.799→0.774), while silhouette *rises* monotonically (0.038→0.051→0.059). Not the over-smoothing story originally expected (that would predict silhouette falling too) — deeper GAT layers produce more separated embeddings but a worse classifier, more consistent with the GAT overfitting its own representation than with embedding collapse |
-| Classification head | CLS linear vs CellGAT (PPI) | Test accuracy, macro F1 | CellGAT wins on both, and the macro F1 gap is now the clearer story: accuracy 0.912 vs 0.909 (small), macro F1 **0.847 vs 0.779** (+6.7pp) — CellGAT's real advantage is balance across classes, not raw accuracy |
+| GNN depth | GeneGAT at 1 / 2 / 3 layers (joint) | Test accuracy, macro F1, UMAP | Clean, consistent split: accuracy and macro F1 both fall monotonically with depth (0.918→0.913→0.905; 0.823→0.799→0.774), while silhouette *rises* monotonically (0.038→0.051→0.059). Follow-up check: neither classic over-smoothing nor simple overfitting explains this — train-split silhouette *also* rises with depth (0.083→0.116→0.114, not falling, ruling out over-smoothing), and the train/test silhouette gap doesn't widen monotonically either (0.040→0.057→0.047, ruling out a clean overfitting story). Best read: 2D UMAP silhouette and the classifier's use of the raw 256-dim embedding are measuring different things, and depth pulls them in opposite directions for reasons not yet isolated |
+| Classification head | CLS linear vs CellGAT (PPI) vs CellGraph (cell k-NN) | Test accuracy, macro F1 | CellGAT wins outright: accuracy 0.912, macro F1 **0.847 ± 0.007** (tightest std of the three). CellGraph (Option C, new cell-cell k-NN head) beats CLS on macro F1 (0.823 ± 0.021 vs 0.779 ± 0.072) with much tighter std, but doesn't catch CellGAT — accuracy 0.908, in between the other two. Gene-level PPI-during-classification (Option B) remains the strongest single addition; cell-level (Option C) helps but less, at least in this batch-level approximation (no EM refinement over the full dataset, unlike scBiGNN's actual cell-cell graph) |
 
 Notes:
 - Switching from unsupervised Leiden clusters to `pbmc3k_processed()`'s real expert
@@ -283,6 +299,19 @@ Notes:
   single run and stayed solid with tight std across seeds. Masking ratio and
   tokenization remain genuinely inconclusive — their std is wide enough that no
   configuration is confidently better than another.
+- **Classification head's third condition, "cellgraph"**, was added after
+  cross-referencing the same GNN-in-single-cell-omics review that motivated the
+  gnn_depth experiment — it flagged that PRISM had no cell-cell graph component at
+  all (Options A and B both only model gene-gene structure), unlike scBiGNN's
+  bilevel (gene-level + cell-level) design. `CellGraphClassificationHead`
+  (`model/heads.py`) + `CellCellGAT` (`model/gnn.py`) close part of that gap with a
+  k-NN graph over cell `[CLS]` embeddings, built fresh from cosine similarity within
+  each training batch — a cheaper approximation of scBiGNN's actual cell-cell graph,
+  which is built once over the *entire* dataset via an EM loop. Adding these fields
+  to `ModelConfig` changed the config hash for every cached experiment (even
+  unrelated ones at default values), so re-running the full 8-experiment suite from
+  here will retrain everything rather than hitting the old cache — a one-time cost,
+  not a recurring one.
 - All numbers above are from the stratified train/val/test split (see `data/dataset.py`'s
   `load_datasets()`) with the corrected STRING edge-weight normalization (see
   `model/gene_graph.py`) — gene-embedding and CellGAT experiments run against live

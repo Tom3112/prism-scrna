@@ -48,6 +48,11 @@ class ModelConfig:
     use_gat_head: bool = False          # False = CLS linear probe, True = CellGATHead
     gat_head_n_heads: int = 4           # attention heads in the classification GAT
 
+    # Cell-cell GNN classifier head (Option C — batch-level cell k-NN graph)
+    use_cell_graph: bool = False        # True = CellGraphClassificationHead
+    cell_graph_k: int = 5               # neighbors per cell in the k-NN graph
+    cell_graph_heads: int = 4           # attention heads in the cell-cell GAT
+
 
 @dataclass
 class PretrainConfig:

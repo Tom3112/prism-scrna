@@ -183,6 +183,72 @@ class GeneGAT(nn.Module):
         return x
 
 
+def _build_knn_graph(embeddings: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    k-NN graph over a batch of embeddings via cosine similarity — directed
+    edges from each node to its k nearest neighbors (self excluded).
+
+    Edge weight is cosine similarity rescaled from [-1, 1] to [0, 1] so it
+    plays the same role GATConv already expects from STRING confidence
+    scores (higher weight -> stronger attention).
+
+    Graph structure is built from detached embeddings (no gradient through
+    which edges exist, only through the GAT's message values) — same
+    convention as k-NN-graph-based GNN methods generally use.
+    """
+    B = embeddings.size(0)
+    k = min(k, B - 1)
+    if k <= 0:
+        return (
+            torch.zeros(2, 0, dtype=torch.long, device=embeddings.device),
+            torch.zeros(0, device=embeddings.device),
+        )
+    norm = F.normalize(embeddings.detach(), dim=-1)
+    sim = norm @ norm.t()
+    sim.fill_diagonal_(-float("inf"))
+    topk_sim, topk_idx = sim.topk(k, dim=-1)
+    src = torch.arange(B, device=embeddings.device).unsqueeze(1).expand(-1, k).reshape(-1)
+    dst = topk_idx.reshape(-1)
+    weight = ((topk_sim.reshape(-1) + 1) / 2).clamp(0, 1)
+    return torch.stack([src, dst]), weight
+
+
+class CellCellGAT(nn.Module):
+    """
+    Option C: refines a batch of cell embeddings using a k-NN graph built
+    from cosine similarity between cells IN THAT BATCH.
+
+    This is the cell-level counterpart to GeneGAT/CellGAT, which both only
+    ever model gene-gene structure — no PRISM variant models cell-cell
+    structure at all until this one. It's a cheap approximation of
+    scBiGNN's actual cell-level GNN, which builds one graph over the WHOLE
+    dataset via an EM loop (pseudo-labels from a gene-level GNN determine
+    which cells are "close"); this version rebuilds a small graph fresh
+    every forward pass from whatever cells happen to share a batch, so
+    quality depends on batch composition and there's no EM refinement.
+
+    Args:
+        hidden_dim: cell embedding dimension.
+        k         : neighbors per cell (clamped to batch_size - 1).
+        n_heads   : GAT attention heads.
+        dropout   : dropout in attention weights.
+    """
+
+    def __init__(self, hidden_dim: int, k: int = 5, n_heads: int = 4, dropout: float = 0.1):
+        super().__init__()
+        self.k = k
+        self.gat = GATConv(hidden_dim, hidden_dim, n_heads=n_heads, dropout=dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, cell_emb: torch.Tensor) -> torch.Tensor:
+        """cell_emb: (B, hidden_dim) -> (B, hidden_dim), residual-refined."""
+        edge_index, edge_weight = _build_knn_graph(cell_emb, self.k)
+        if edge_index.numel() == 0:
+            return cell_emb
+        delta = self.gat(cell_emb, edge_index, edge_weight)
+        return self.norm(cell_emb + delta)
+
+
 def build_gene_gat(
     model_cfg,
     processed_path: str,

@@ -24,7 +24,7 @@ import anndata as ad
 from data.dataset import load_datasets
 from model.transformer import scRNAEncoder
 from model.gnn import build_gene_gat
-from model.heads import CellTypeClassificationHead, CellGATClassificationHead
+from model.heads import CellTypeClassificationHead, CellGATClassificationHead, CellGraphClassificationHead
 from model.gene_graph import build_gene_graph
 from train.config import DataConfig, ModelConfig, FinetuneConfig
 from train.pretrain import get_cosine_schedule_with_warmup
@@ -249,6 +249,15 @@ def finetune(
             n_gat_heads=model_cfg.gat_head_n_heads,
         ).to(device)
         head_type = "CellGAT"
+    elif model_cfg.use_cell_graph:
+        head = CellGraphClassificationHead(
+            hidden_dim=model_cfg.hidden_dim,
+            num_classes=num_classes,
+            dropout=model_cfg.dropout,
+            k=model_cfg.cell_graph_k,
+            n_heads=model_cfg.cell_graph_heads,
+        ).to(device)
+        head_type = "CellGraph"
     else:
         head = CellTypeClassificationHead(
             hidden_dim=model_cfg.hidden_dim,

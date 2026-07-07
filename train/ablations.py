@@ -2,6 +2,9 @@
 Runs the 8 ablation experiments listed in README.md's "Ablation Experiments" table
 (7 from the original project brief, plus gnn_depth — added after cross-referencing
 the GNN-in-single-cell-omics review that motivated PRISM's GeneGAT/CellGAT design).
+classification_head's third condition, "cellgraph" (Option C — CellGraphClassificationHead,
+a batch-level cell-cell k-NN graph), was added after the same review flagged that
+PRISM had no cell-cell graph component at all, unlike scBiGNN's bilevel design.
 
 Each experiment varies one axis of DataConfig/ModelConfig/PretrainConfig/FinetuneConfig and
 reuses pretrain()/finetune() from train/pretrain.py and train/finetune.py. Pretrain and finetune
@@ -324,7 +327,11 @@ def experiment_classification_head(device: torch.device) -> list[dict]:
     data_cfg = DataConfig()
 
     results = []
-    for label, head_model_cfg in [("cls", ModelConfig()), ("gat", ModelConfig(use_gat_head=True))]:
+    for label, head_model_cfg in [
+        ("cls", ModelConfig()),
+        ("gat", ModelConfig(use_gat_head=True)),
+        ("cellgraph", ModelConfig(use_cell_graph=True)),
+    ]:
         print(f"\n-- classification_head={label} --")
         agg = multi_seed_run(data_cfg, head_model_cfg, device, want_silhouette=False)
         results.append({"head": label, **agg})

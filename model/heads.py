@@ -1,14 +1,19 @@
 """
 Task-specific heads that attach to scRNAEncoder.
 
-Two classification heads are provided:
+Three classification heads are provided:
 
   CellTypeClassificationHead  — baseline: linear probe on [CLS] token.
-  CellGATClassificationHead   — GNN-as-classifier: uses the STRING PPI graph
-      *during* the classification forward pass (not just embedding init).
-      Gene hidden states are refined by a GATConv layer (PPI edges) then
-      pooled via attention → cell embedding → linear head.
-      This closes the architectural gap with scBiGNN-style methods.
+  CellGATClassificationHead   — GNN-as-classifier (Option B): uses the STRING
+      PPI graph *during* the classification forward pass (not just embedding
+      init). Gene hidden states are refined by a GATConv layer (PPI edges)
+      then pooled via attention → cell embedding → linear head. Closes the
+      architectural gap with scBiGNN-style gene-level GNNs.
+  CellGraphClassificationHead — cell-cell GNN (Option C): refines the [CLS]
+      embedding using a k-NN graph over OTHER CELLS IN THE SAME BATCH before
+      classifying. Closes the remaining gap with scBiGNN's *bilevel* design —
+      Options A/B both only ever model gene-gene structure; this is PRISM's
+      first cell-cell graph component.
 """
 
 from __future__ import annotations
@@ -16,7 +21,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from model.gnn import GATConv
+from model.gnn import GATConv, CellCellGAT
 
 _SPECIAL = 3   # [PAD]=0, [CLS]=1, [MASK]=2 — must match transformer.py
 
@@ -219,6 +224,51 @@ class CellGATClassificationHead(nn.Module):
         cell_emb = (alpha.unsqueeze(-1) * hidden).sum(1)                 # (B, D)
         logits   = self.proj(self.drop(self.norm(cell_emb)))
 
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(logits, labels)
+        return loss, logits
+
+
+class CellGraphClassificationHead(nn.Module):
+    """
+    Option C: refines each cell's [CLS] embedding using a k-NN graph over
+    the OTHER CELLS IN THE SAME BATCH, before classifying.
+
+    Same (cls_emb, labels) -> (loss, logits) interface as
+    CellTypeClassificationHead, so it's a drop-in alternative regardless of
+    which encoder produced cls_emb (plain or GeneGAT-embedded).
+
+    Args:
+        hidden_dim  : transformer hidden dimension.
+        num_classes : number of cell types.
+        dropout     : dropout rate.
+        k           : neighbors per cell in the batch-level k-NN graph.
+        n_heads     : attention heads in the cell-cell GAT layer.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float = 0.1,
+        k: int = 5,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+        self.cell_gat = CellCellGAT(hidden_dim, k=k, n_heads=n_heads, dropout=dropout)
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.proj = nn.Linear(hidden_dim, num_classes)
+
+    def forward(
+        self,
+        cls_emb: torch.Tensor,               # (B, hidden_dim)
+        labels: torch.Tensor | None = None,  # (B,) integer class ids
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Returns (loss_or_None, logits). logits shape: (B, num_classes)."""
+        refined = self.cell_gat(cls_emb)
+        logits = self.proj(self.drop(self.norm(refined)))
         loss = None
         if labels is not None:
             loss = nn.functional.cross_entropy(logits, labels)
