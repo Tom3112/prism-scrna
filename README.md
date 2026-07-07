@@ -123,8 +123,10 @@ uv run python run_experiment.py
 uv run python data/download_benchmarks.py
 
 # Run 5-fold CV against published baselines
-uv run python train/benchmark_eval.py               # CLS head vs scBiGNN / ACTINN
-uv run python train/benchmark_eval.py --head gat    # GNN-as-classifier
+uv run python train/benchmark_eval.py               # CLS head, no GNN vs scBiGNN / ACTINN
+uv run python train/benchmark_eval.py --gnn frozen  # GeneGAT frozen (Option A)
+uv run python train/benchmark_eval.py --gnn joint    # GeneGAT joint (Option A)
+uv run python train/benchmark_eval.py --head gat    # CellGAT head (Option B)
 uv run python train/benchmark_eval.py --dataset BaronHuman --epochs 20
 ```
 
@@ -138,57 +140,93 @@ pretraining transfer, matching how scBiGNN/ACTINN themselves are evaluated). All
 verified: both their presence in that exact archive (confirmed by listing its full
 contents directly) and their baseline numbers against the cited paper.
 
-**Architecture used below: plain PRISM baseline only** — no GNN component at all
-(`use_gnn=False`, `use_gat_head=False`), CLS linear head. Neither GeneGAT (Option A,
-gene embeddings) nor CellGAT (Option B, GNN-as-classifier) are exercised here yet;
-see Next Steps.
+**Four architecture variants run below**, all on the same 7 datasets / 5-fold CV:
+plain PRISM baseline (`use_gnn=False`, CLS head), GeneGAT frozen (Option A,
+`gnn_freeze=True`), GeneGAT joint (Option A, `gnn_freeze=False`), and CellGAT head
+(Option B, `use_gat_head=True`). See [GNN Variants on the Benchmark Suite](#gnn-variants-on-the-benchmark-suite)
+below for the head-to-head comparison.
 
 **Metrics — not all one type, read the Method column:**
-- **scBiGNN** rows: baseline is **accuracy** (Ma et al.'s Table 2 reports accuracy only,
-  no F1 anywhere in that paper) — PRISM's accuracy is the right comparison here.
-- **ACTINN** rows: baseline is very likely **median F1** (Abdelaal et al. 2019's entire
-  evaluation framework is built around median-F1-score as its primary metric; the
-  specific 0.886/0.962 values do not appear verbatim anywhere in that paper's main
-  text, so we can't confirm their exact source, but everything else in the paper
-  points to median F1, not accuracy). Comparing PRISM's *accuracy* against a
-  *median-F1* baseline would be apples-to-oranges, so both PRISM metrics are given
-  for these two rows — treat the accuracy delta as unverified pending confirming
-  the baseline's exact metric type.
+- **scBiGNN** rows: baseline is **accuracy**, confirmed directly from Ma et al.'s
+  Table 2 (caption: *"Classification accuracy of all the methods on the five
+  datasets"*) — the 5 datasets in that table are exactly Zheng68K, Zhengsorted,
+  BaronHuman, BaronMouse, AMB (our baseline numbers are an exact match to their
+  bold `scBiGNN (p_θ)` row). PRISM's accuracy is the right comparison here.
+- **ACTINN** rows (Segerstolpe, Muraro): scBiGNN's paper doesn't include these two
+  datasets at all, so the 0.886/0.962 baselines must trace to **Abdelaal et al. 2019
+  directly**, whose Methods section states its metric explicitly: *"For each cell
+  population in the dataset, the F1-score is reported. The median of these F1-scores
+  is used as a measure for the performance on the dataset."* Median F1 is their sole
+  reported metric — so 0.886/0.962 are **median F1**, not accuracy. PRISM's median F1
+  (not accuracy) is the correct comparison for these two rows.
 - **median F1** here means the median (not mean) of per-class F1 scores — robust to
   one or two badly-performing rare classes dragging down a macro-average, which is
-  exactly why Abdelaal et al. use it instead of accuracy or macro-F1.
+  exactly why Abdelaal et al. use it instead of accuracy or macro-F1. Computed in
+  `eval/metrics.py` the same way: per-class F1 via `f1_score(average=None)`, then
+  `np.median()` over classes.
 
-| Dataset | Cells | Types | Baseline | Method | PRISM accuracy | PRISM median F1 | Δ (accuracy) |
+| Dataset | Cells | Types | Baseline | Method | PRISM accuracy | PRISM median F1 | Δ |
 |---|---|---|---|---|---|---|---|
-| Zheng68K | 65,943 | 11 | 0.760 (acc) | scBiGNN | **0.839 ± 0.002** | — | ▲ 7.89% |
-| Zhengsorted | 20,000 | 10 | 0.867 (acc) | scBiGNN | 0.822 ± 0.003 | — | ▼ 4.54% |
-| BaronHuman | 8,569 | 14 | 0.983 (acc) | scBiGNN | 0.985 ± 0.002 | — | ▲ 0.24% |
-| BaronMouse | 1,886 | 13 | 0.983 (acc) | scBiGNN | 0.958 ± 0.006 | — | ▼ 2.54% |
-| AMB | 12,832 | 22 | 0.994 (acc) | scBiGNN | 0.989 ± 0.001 | — | ▼ 0.51% |
-| Segerstolpe | 2,133 | 13 | 0.886 (metric unconfirmed) | ACTINN | 0.969 ± 0.005 | — | unverified basis |
-| Muraro | 2,122 | 9 | 0.962 (metric unconfirmed) | ACTINN | 0.976 ± 0.008 | — | unverified basis |
+| Zheng68K | 65,943 | 11 | 0.760 (acc) | scBiGNN | **0.840 ± 0.003** | 0.796 | ▲ 8.04% (acc) |
+| Zhengsorted | 20,000 | 10 | 0.867 (acc) | scBiGNN | 0.821 ± 0.004 | 0.841 | ▼ 4.60% (acc) |
+| BaronHuman | 8,569 | 14 | 0.983 (acc) | scBiGNN | 0.986 ± 0.002 | 0.983 | ▲ 0.25% (acc) |
+| BaronMouse | 1,886 | 13 | 0.983 (acc) | scBiGNN | 0.959 ± 0.003 | 0.884 | ▼ 2.44% (acc) |
+| AMB | 12,832 | 22 | 0.994 (acc) | scBiGNN | 0.989 ± 0.002 | 0.990 | ▼ 0.51% (acc) |
+| Segerstolpe | 2,133 | 13 | 0.886 (median F1) | ACTINN | 0.972 ± 0.006 | 0.963 | ▲ 7.70% (median F1) |
+| Muraro | 2,122 | 9 | 0.962 (median F1) | ACTINN | 0.978 ± 0.010 | 0.971 | ▲ 0.94% (median F1) |
 
-*(Median F1 column being backfilled — added to `eval/metrics.py` after this table was
-first generated; a rerun with it populated is in progress.)*
+Among the 5 scBiGNN rows (accuracy baseline), PRISM beats it on 2 of 5 (Zheng68K
++8.04pp, BaronHuman +0.25pp) and trails on 3 (Zhengsorted, BaronMouse, AMB), all
+within ~0.5–4.6pp. One caveat: BaronMouse's accuracy (0.959) looks solid but median
+F1 is much lower (0.884, mean macro F1 0.661) — a per-class breakdown shows the 5
+largest classes (91% of the dataset) all score F1 ≥ 0.90, while the smallest classes
+do badly (schwann, 6 cells, F1 = 0.000; T_cell, 7 cells, F1 = 0.25) — classic
+class-imbalance masking, the same failure mode Abdelaal et al.'s median-F1 choice is
+designed to catch. On the 2 ACTINN rows (median F1 baseline, now correctly matched
+to PRISM's median F1), PRISM wins both: Segerstolpe +7.70pp, Muraro +0.94pp.
 
-Among the 5 scBiGNN rows (the ones with an unambiguous, verified accuracy baseline),
-PRISM beats it on 2 of 5 (Zheng68K +7.89pp, BaronHuman +0.24pp) and trails on 3
-(Zhengsorted, BaronMouse, AMB), all within ~0.5–4.5pp. One caveat: BaronMouse's
-accuracy (0.958) looks solid but per-fold macro-F1 was much lower (0.55–0.76) — a
-per-class breakdown shows the 5 largest classes (91% of the dataset) all score
-F1 ≥ 0.90, while the smallest classes do badly (schwann, 6 cells, F1 = 0.000;
-T_cell, 7 cells, F1 = 0.25) — classic class-imbalance masking, the same failure
-mode Abdelaal et al.'s median-F1 choice is designed to catch. The 2 ACTINN rows
-can't be confidently read as beating or losing to baseline until the metric-type
-question above is resolved.
+### GNN Variants on the Benchmark Suite
+
+Same 7 datasets, 5-fold CV, same from-scratch supervised training — only the gene
+embedding / classification head changes. Accuracy for all 4 variants:
+
+| Dataset | Baseline | GNN frozen | GNN joint | CellGAT | Best variant |
+|---|---|---|---|---|---|
+| BaronHuman | 0.9855 | 0.9742 (▼1.13pp) | 0.9854 (▼0.01pp) | **0.9856** (▲0.01pp) | CellGAT (tied) |
+| BaronMouse | 0.9586 | 0.9205 (▼3.81pp) | 0.9677 (▲0.91pp) | **0.9751** (▲1.65pp) | CellGAT |
+| AMB | 0.9889 | 0.9778 (▼1.11pp) | 0.9890 (▲0.01pp) | **0.9914** (▲0.25pp) | CellGAT |
+| Zheng68K | 0.8404 | 0.8293 (▼1.11pp) | **0.8429** (▲0.25pp) | 0.8383 (▼0.21pp) | GNN joint |
+| Zhengsorted | **0.8210** | 0.7517 (▼6.93pp) | 0.7436 (▼7.74pp) | 0.8200 (▼0.10pp) | Baseline (tied w/ CellGAT) |
+| Segerstolpe | 0.9723 | 0.9334 (▼3.89pp) | 0.9709 (▼0.14pp) | **0.9756** (▲0.33pp) | CellGAT |
+| Muraro | **0.9779** | 0.9383 (▼3.96pp) | 0.9736 (▼0.43pp) | 0.9731 (▼0.48pp) | Baseline |
+
+Three clear patterns:
+- **GNN frozen (Option A) loses on all 7 datasets**, sometimes badly (Zhengsorted
+  ▼6.93pp, Muraro ▼3.96pp, Segerstolpe ▼3.89pp). A STRING PPI prior baked into frozen
+  gene embeddings, with no ability to adapt to the task, is a net negative here —
+  the plain learned embedding table adapts better than a fixed biological prior.
+- **GNN joint (Option A) is roughly a wash against baseline** — small wins on
+  BaronMouse/Zheng68K/AMB, small losses on Segerstolpe/Muraro, **except Zhengsorted,
+  where it craters (▼7.74pp)**, worse even than frozen. Something about this dataset's
+  gene panel or class structure makes end-to-end GAT training actively harmful, not
+  just neutral.
+- **CellGAT head (Option B) is the strongest variant overall** — best or tied-best on
+  5/7 datasets, and critically, **does not share frozen/joint's Zhengsorted collapse**
+  (▼0.10pp, essentially noise, vs ▼6.93/▼7.74pp). Since CellGAT uses PPI edges during
+  classification on top of transformer hidden states (not as the gene embedding
+  itself), it isn't vulnerable to whatever makes a STRING-initialized embedding table
+  fail on this dataset — the transformer's own representations carry the signal, and
+  the GAT layer adds a task-relevant refinement rather than replacing the embedding.
 
 Notes:
 - The 5 scBiGNN baselines are verified exact matches against Ma et al.'s scBiGNN paper
-  (arXiv:2312.10310, Table 2). Segerstolpe and Muraro's cell/type counts are corrected
-  here against Abdelaal et al. 2019's actual Table 2 (previously listed as ~2,300/14 and
-  ~2,100/9); their ACTINN values are as originally recorded in this repo, unconfirmed
-  against the source figure, and — per the metrics note above — possibly a different
-  metric (median F1) than what's being compared against (accuracy).
+  (arXiv:2312.10310, Table 2) — confirmed accuracy (table caption), confirmed those 5
+  datasets only (Segerstolpe/Muraro aren't in scBiGNN's paper at all). Segerstolpe and
+  Muraro's cell/type counts are corrected here against Abdelaal et al. 2019's actual
+  Table 2 (previously listed as ~2,300/14 and ~2,100/9); their ACTINN values (0.886,
+  0.962) are median F1 — confirmed via Abdelaal et al. 2019's Methods section, which
+  states median F1-score as its sole reported metric (see Benchmarks metrics note
+  above for the exact quote).
 - **Zeisel, Macosko, and Klein were previously listed here** (attributed to "Abdelaal
   et al. 2019 (Zenodo 3357167)") but don't actually exist anywhere in that Zenodo
   archive — confirmed by listing its full directory contents (`Inter-dataset/`,

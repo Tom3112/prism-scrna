@@ -225,6 +225,9 @@ def evaluate_dataset(
     splits  = make_kfold_splits(adata, k=k)
     species = _species_for(name)
 
+    # processed_path needed as co-expression fallback if STRING API is unreachable
+    proc_path = os.path.join(BENCH_DIR, BENCHMARK_FILES[name]).replace(".h5ad", "_processed.h5ad")
+
     # Build PPI graph once for the whole dataset (same HVGs across all folds)
     ppi_edge_index = ppi_edge_weight = None
     if model_cfg.use_gat_head:
@@ -236,6 +239,7 @@ def evaluate_dataset(
             cache_dir=ppi_cache_dir,
             min_score=model_cfg.string_min_score,
             species=species,
+            processed_path=proc_path,
         )
 
     # GeneGAT (Option A) is trainable in joint mode, so it must be rebuilt fresh
@@ -243,9 +247,8 @@ def evaluate_dataset(
     # GAT weights into fold N+1, breaking CV independence. The underlying STRING
     # edge_index/edge_weight are still disk-cached, so rebuilding the nn.Module
     # wrapper each fold is cheap.
-    proc_path = None
-    if model_cfg.use_gnn:
-        proc_path = os.path.join(BENCH_DIR, BENCHMARK_FILES[name]).replace(".h5ad", "_processed.h5ad")
+    if not model_cfg.use_gnn:
+        proc_path = None
 
     fold_accs, fold_f1s, fold_median_f1s = [], [], []
     for fold, (train_idx, test_idx) in enumerate(splits, 1):
