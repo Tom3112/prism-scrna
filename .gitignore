@@ -12,7 +12,7 @@ env/
 
 # Data files (large; reproducible via data/download.py)
 data/*.h5ad
-data/string_graph_score700.npz
+data/string_graph_score*.npz
 data/benchmarks/
 
 # Checkpoints and experiment artifacts

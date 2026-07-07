@@ -248,23 +248,24 @@ Notes:
 ## Ablation Experiments
 
 Run with `uv run python train/ablations.py` (or `--experiment NAME` for a single one).
-Pretrain/fine-tune runs are cached on disk keyed by config, so shared baseline runs
-aren't recomputed across experiments. Results below are on PBMC 3k (`pbmc3k_processed()`,
-2,638 cells, 8 real expert-annotated cell types — CD4 T, CD14+ Monocytes, B, CD8 T, NK,
-FCGR3A+ Monocytes, Dendritic, Megakaryocytes — not unsupervised Leiden pseudo-labels);
-see `notebooks/03_ablations.ipynb` for plots and `experiments/ablations/summary.md` for
-the raw tables.
+Pretrain/fine-tune runs are cached on disk keyed by config **and seed**, so shared
+baseline runs aren't recomputed across experiments or seeds. Results below are on
+PBMC 3k (`pbmc3k_processed()`, 2,638 cells, 8 real expert-annotated cell types — CD4 T,
+CD14+ Monocytes, B, CD8 T, NK, FCGR3A+ Monocytes, Dendritic, Megakaryocytes — not
+unsupervised Leiden pseudo-labels), **mean ± std across 3 seeds** (42, 123, 7 — vary
+model init + data shuffling only, not the train/val/test split itself); see
+`experiments/ablations/summary.md` for the raw tables.
 
 | Experiment | Variable | Metric | Result |
 |---|---|---|---|
-| Masking ratio | 5%, 15%, 25%, 40% | Val loss, downstream F1 | F1 rises with mask ratio (0.854 → 0.868 → 0.863 → **0.864**), accuracy flat (0.913–0.924) — no clear optimum, differences are within noise |
-| Tokenization | Rank-based vs raw expression bins | Embedding UMAP quality (silhouette) | Rank: **-0.139** vs expr_bin: -0.158 — a small edge for rank ordering, much narrower than seen with pseudo-labels |
-| Model depth | 2 / 4 / 6 layers | Val loss, fine-tune accuracy | Val loss falls monotonically with depth (6.47 → 6.39 → 6.18); accuracy non-monotonic (0.909 → **0.917** → 0.913) — depth helps pretraining loss but not classification here |
-| Pretrain vs scratch | Pretrained encoder vs random init | Fine-tune accuracy | Scratch (**0.924**) still edges out pretrained (0.917) even with real labels — the earlier "confounded by circular Leiden labels" caveat no longer applies, and MGP pretraining still isn't clearly helping fine-tune accuracy on this small a dataset |
-| Freeze vs fine-tune | Frozen encoder vs full fine-tune | Fine-tune accuracy | Full fine-tune **0.917** vs frozen 0.602 — the one result that stays decisive under real labels, same ~32-point gap as before |
-| Gene embeddings | Baseline vs GNN frozen vs GNN joint | Fine-tune accuracy, UMAP | Baseline and GNN joint tie on accuracy (both 0.917); GNN frozen worse (0.871). Silhouette no longer favors joint training (-0.138 baseline vs -0.100 frozen vs -0.134 joint) — the clear GNN-joint win seen with Leiden pseudo-labels does not replicate on the harder, real-label task |
-| GNN depth | GeneGAT at 1 / 2 / 3 layers (joint) | Fine-tune accuracy, UMAP | Noisy: accuracy peaks at 2 layers (0.917) and drops at 3 (0.864); silhouette peaks at 1 layer (0.037) and is negative at both 2 and 3. Depth's effect on embedding quality doesn't move consistently with either metric here — treat the earlier over-smoothing story as unconfirmed until repeated across seeds |
-| Classification head | CLS linear vs CellGAT (PPI) | Fine-tune accuracy | CellGAT (**0.928**) ahead of CLS (0.917) by 1.1 points — small but the largest CellGAT-vs-CLS gap seen across both label sources |
+| Masking ratio | 5%, 15%, 25%, 40% | Test accuracy, macro F1 | Accuracy 0.908→0.909→**0.921**→0.914, macro F1 noisy (0.78–0.84) — 25% edges ahead but overlaps the others' std, no clear optimum |
+| Tokenization | Rank-based vs raw expression bins | Embedding UMAP quality (silhouette) | Rank **-0.101 ± 0.020** vs expr_bin -0.089 ± 0.054 — sign flips vs the single-run result, but expr_bin's std is 2.5x rank's; noise-level difference, not a real edge either way |
+| Model depth | 2 / 4 / 6 layers | Val loss, test accuracy, macro F1 | Val loss still falls monotonically with depth (6.52→6.35→6.19); accuracy non-monotonic (0.913→0.909→**0.914**) but macro F1 favors depth 6 clearly (0.824→0.779→**0.865**) — depth helps more than accuracy alone suggested |
+| Pretrain vs scratch | Pretrained encoder vs random init | Test accuracy | Scratch (**0.914 ± 0.005**) still edges out pretrained (0.909 ± 0.011) — confirmed across 3 seeds, not a single-run fluke; MGP pretraining still isn't earning its cost on a dataset this small |
+| Freeze vs fine-tune | Frozen encoder vs full fine-tune | Test accuracy, macro F1 | Full fine-tune **0.909 ± 0.011** vs frozen 0.597 ± 0.002 (macro F1 0.779 vs 0.194) — the tightest std of any result here (frozen's failure is consistent, not noisy) and by far the most decisive finding in the whole ablation suite |
+| Gene embeddings | Baseline vs GNN frozen vs GNN joint | Test accuracy, macro F1, UMAP | GNN joint now **wins clearly**: accuracy 0.913 vs baseline 0.909, macro F1 0.799 vs 0.779, and silhouette 0.061 ± 0.039 vs baseline's -0.101 ± 0.020 — non-overlapping ranges. Frozen is worse on every metric (0.865 acc, 0.624 macro F1). **This reverses the single-run "did not replicate" verdict** — the joint-training embedding edge is real, just too small to see without averaging over seeds |
+| GNN depth | GeneGAT at 1 / 2 / 3 layers (joint) | Test accuracy, macro F1, UMAP | Now a clean, consistent split: accuracy and macro F1 both fall monotonically with depth (0.918→0.913→0.905; 0.823→0.799→0.774), while silhouette *rises* monotonically (0.038→0.051→0.059). Not the over-smoothing story originally expected (that would predict silhouette falling too) — deeper GAT layers produce more separated embeddings but a worse classifier, more consistent with the GAT overfitting its own representation than with embedding collapse |
+| Classification head | CLS linear vs CellGAT (PPI) | Test accuracy, macro F1 | CellGAT wins on both, and the macro F1 gap is now the clearer story: accuracy 0.912 vs 0.909 (small), macro F1 **0.847 vs 0.779** (+6.7pp) — CellGAT's real advantage is balance across classes, not raw accuracy |
 
 Notes:
 - Switching from unsupervised Leiden clusters to `pbmc3k_processed()`'s real expert
@@ -274,16 +275,21 @@ Notes:
   isn't valid input for rank/expr_bin tokenization; also fixed a dormant labeling bug
   where the louvain→cell-type mapping assumed numeric cluster IDs but the real column
   already contains descriptive names like `"CD4 T cells"`).
-- Real annotation resolves the label-circularity caveat on the pretrain-vs-scratch
-  experiment, but accuracy across the board is lower and noisier than with Leiden
-  pseudo-labels (test set is the same size, 264 cells, but the task itself is harder) —
-  several deltas here that looked clean before (GNN joint's win, the depth-vs-silhouette
-  over-smoothing pattern) don't hold up under the real, harder task and should be read
-  as inconclusive on a single run rather than confirmed effects.
+- Adding 3 seeds (42, 123, 7) changed two conclusions from the single-run pass: gene
+  embeddings' GNN-joint edge, which looked noise-level on one run, is consistent and
+  non-overlapping once averaged; and GNN depth's silhouette-vs-accuracy relationship,
+  which looked directionless on one run, is a clean monotonic split in both directions
+  once averaged. Freeze-vs-fine-tune and pretrain-vs-scratch were already solid on a
+  single run and stayed solid with tight std across seeds. Masking ratio and
+  tokenization remain genuinely inconclusive — their std is wide enough that no
+  configuration is confidently better than another.
 - All numbers above are from the stratified train/val/test split (see `data/dataset.py`'s
   `load_datasets()`) with the corrected STRING edge-weight normalization (see
   `model/gene_graph.py`) — gene-embedding and CellGAT experiments run against live
-  STRING PPI data, not the co-expression fallback.
+  STRING PPI data, not the co-expression fallback. Only `PretrainConfig.seed` /
+  `FinetuneConfig.seed` vary across the 3 seeds (model init + data shuffling) —
+  `DataConfig.seed` (the train/val/test split itself) stays fixed at 42 for all of them,
+  so every seed sees identical splits.
 - `val_loss` is only comparable *within* an experiment, not between tokenization
   schemes: rank predicts over the full gene vocabulary (~2,000-way) while expr_bin
   predicts over expression bins (11-way), so their losses live on different scales.
