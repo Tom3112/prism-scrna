@@ -30,6 +30,7 @@ Usage:
     uv run python train/benchmark_eval.py --gnn frozen        # GeneGAT frozen (Option A)
     uv run python train/benchmark_eval.py --gnn joint         # GeneGAT joint (Option A)
     uv run python train/benchmark_eval.py --head gat          # CellGAT head (Option B)
+    uv run python train/benchmark_eval.py --head cellgraph    # CellGraph head (Option C)
     uv run python train/benchmark_eval.py --dataset Zeisel --epochs 20
 
 Results are saved per-variant to experiments/benchmark_results_<head>_<gnn>.npy so
@@ -53,7 +54,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.benchmark_utils import load_benchmark, make_kfold_splits, BENCHMARK_FILES, BENCH_DIR
 from data.dataset import scRNADataset
 from model.transformer import scRNAEncoder
-from model.heads import CellTypeClassificationHead, CellGATClassificationHead
+from model.heads import CellTypeClassificationHead, CellGATClassificationHead, CellGraphClassificationHead
 from model.gene_graph import build_gene_graph
 from model.gnn import build_gene_gat
 from train.config import DataConfig, ModelConfig, FinetuneConfig
@@ -163,6 +164,14 @@ def train_one_fold(
             ppi_edge_weight=ppi_edge_weight.to(device),
             n_gat_heads=model_cfg.gat_head_n_heads,
         ).to(device)
+    elif model_cfg.use_cell_graph:
+        head = CellGraphClassificationHead(
+            hidden_dim=model_cfg.hidden_dim,
+            num_classes=num_classes,
+            dropout=model_cfg.dropout,
+            k=model_cfg.cell_graph_k,
+            n_heads=model_cfg.cell_graph_heads,
+        ).to(device)
     else:
         head = CellTypeClassificationHead(
             hidden_dim=model_cfg.hidden_dim,
@@ -217,8 +226,9 @@ def evaluate_dataset(
     gnn_label = "none"
     if model_cfg.use_gnn:
         gnn_label = "frozen" if model_cfg.gnn_freeze else "joint"
+    head_label = "GAT" if model_cfg.use_gat_head else "CellGraph" if model_cfg.use_cell_graph else "CLS"
     print(f"\n{'='*60}")
-    print(f"Dataset: {name}  ({k}-fold CV)  head={'GAT' if model_cfg.use_gat_head else 'CLS'}  gnn={gnn_label}")
+    print(f"Dataset: {name}  ({k}-fold CV)  head={head_label}  gnn={gnn_label}")
     print(f"{'='*60}")
 
     adata   = load_benchmark(name)
@@ -321,8 +331,10 @@ def main():
                         help="Path to pretrained encoder checkpoint")
     parser.add_argument("--k", type=int, default=5, help="Number of CV folds")
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--head", choices=["cls", "gat"], default="cls",
-                        help="cls = [CLS] linear probe; gat = CellGAT (PPI graph during classification)")
+    parser.add_argument("--head", choices=["cls", "gat", "cellgraph"], default="cls",
+                        help="cls = [CLS] linear probe; gat = CellGAT (gene-level PPI graph "
+                             "during classification, Option B); cellgraph = CellGraph "
+                             "(cell-cell k-NN graph during classification, Option C)")
     parser.add_argument("--gnn", choices=["none", "frozen", "joint"], default="none",
                         help="none = plain nn.Embedding; frozen/joint = GeneGAT gene embeddings (Option A)")
     args = parser.parse_args()
@@ -330,6 +342,7 @@ def main():
     device     = _get_device()
     model_cfg  = ModelConfig(
         use_gat_head=(args.head == "gat"),
+        use_cell_graph=(args.head == "cellgraph"),
         use_gnn=(args.gnn != "none"),
         gnn_freeze=(args.gnn == "frozen"),
     )
