@@ -257,9 +257,31 @@ as the scBiGNN/ACTINN rows above.
 **Zhengsorted stands out.** It's HNNVAT's best win by the widest margin, and it's the
 exact dataset where every gene-level PRISM variant plateaus around 0.82–0.84 (and
 GNN frozen/joint collapse to ~0.74–0.75). A real cell-cell graph method dominating
-specifically where PRISM's gene-level approaches struggle most is a concrete,
-evidence-backed reason to run Option C — currently only validated on PBMC 3k — on
-the benchmark suite, Zhengsorted first.
+specifically where PRISM's gene-level approaches struggle most was a concrete,
+evidence-backed reason to test Option C there directly — done below.
+
+**Result: Option C does not close the gap.** Run on Zhengsorted, 5-fold CV, same
+protocol as every other variant:
+
+| Variant | Accuracy |
+|---|---|
+| Baseline | 0.8210 |
+| CellGAT (Option B) | 0.8200 |
+| **CellGraph (Option C)** | **0.8162 ± 0.0035** |
+| GNN frozen (Option A) | 0.7517 |
+| GNN joint (Option A) | 0.7436 |
+| HNNVAT | **0.926** |
+
+CellGraph lands in baseline/CellGAT territory — slightly *below* both, not above —
+and the gap to HNNVAT barely moves (▼11.2pp vs baseline's ▼10.5pp). This confirms
+the caveat flagged before running it: a batch-level k-NN graph, rebuilt fresh every
+forward pass with no EM refinement, isn't the same thing as HNNVAT's or scBiGNN's
+actual full-dataset cell-cell graph. **The finding narrows, not widens:** cell-cell
+structure *may* still be what closes this gap, but only if it's a real,
+persistent, dataset-wide graph — not any cell-cell attention mechanism at all. A
+precomputed full-dataset k-NN graph (rebuilt periodically across epochs rather than
+per-batch) is the next thing to try before concluding cell-cell structure doesn't
+help here.
 
 Notes:
 - The 5 scBiGNN baselines are verified exact matches against Ma et al.'s scBiGNN paper
