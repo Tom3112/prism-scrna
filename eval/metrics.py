@@ -15,14 +15,25 @@ from sklearn.metrics import (
 )
 
 from model.transformer import scRNAEncoder
-from model.heads import CellTypeClassificationHead, CellGATClassificationHead
+from model.heads import CellTypeClassificationHead, CellGATClassificationHead, EMCellGraphClassificationHead
 
 
-def _forward_head(encoder, head, input_ids, attention_mask, labels=None, bin_ids=None):
-    """Unified forward pass for CLS head and GAT head."""
+def _forward_head(encoder, head, input_ids, attention_mask, labels=None, bin_ids=None, idx=None):
+    """
+    Unified forward pass for CLS, GAT, and EM-cell-graph heads.
+
+    EMCellGraphClassificationHead expects an externally-refreshed
+    `head.graph` (a GlobalCellGraph instance, attached by the caller after
+    construction) plus each batch's dataset-index tensor (`idx`) to look up
+    cached neighbor embeddings.
+    """
     if isinstance(head, CellGATClassificationHead):
         hidden = encoder(input_ids, attention_mask, bin_ids)
         return head(hidden, attention_mask, input_ids, labels)
+    elif isinstance(head, EMCellGraphClassificationHead):
+        cls_emb = encoder.get_cls_embedding(input_ids, attention_mask, bin_ids)
+        neighbor_emb = head.graph.get_neighbors(idx)
+        return head(cls_emb, neighbor_emb, labels)
     else:
         cls_emb = encoder.get_cls_embedding(input_ids, attention_mask, bin_ids)
         return head(cls_emb, labels)
@@ -46,9 +57,10 @@ def collect_predictions(
         attention_mask = batch["attention_mask"].to(device)
         cell_type      = batch["cell_type"].to(device)
         bin_ids        = batch["bin_ids"].to(device) if "bin_ids" in batch else None
+        idx            = batch["idx"].to(device) if "idx" in batch else None
 
         with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
-            _, logits = _forward_head(encoder, head, input_ids, attention_mask, bin_ids=bin_ids)
+            _, logits = _forward_head(encoder, head, input_ids, attention_mask, bin_ids=bin_ids, idx=idx)
         preds_list.append(logits.argmax(dim=-1).cpu().numpy())
         labels_list.append(cell_type.cpu().numpy())
 

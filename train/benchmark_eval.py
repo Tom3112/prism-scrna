@@ -31,6 +31,7 @@ Usage:
     uv run python train/benchmark_eval.py --gnn joint         # GeneGAT joint (Option A)
     uv run python train/benchmark_eval.py --head gat          # CellGAT head (Option B)
     uv run python train/benchmark_eval.py --head cellgraph    # CellGraph head (Option C)
+    uv run python train/benchmark_eval.py --head emcellgraph  # EM-refined full-dataset cell graph (Option C2)
     uv run python train/benchmark_eval.py --dataset Zeisel --epochs 20
 
 Results are saved per-variant to experiments/benchmark_results_<head>_<gnn>.npy so
@@ -54,9 +55,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.benchmark_utils import load_benchmark, make_kfold_splits, BENCHMARK_FILES, BENCH_DIR
 from data.dataset import scRNADataset
 from model.transformer import scRNAEncoder
-from model.heads import CellTypeClassificationHead, CellGATClassificationHead, CellGraphClassificationHead
+from model.heads import (
+    CellTypeClassificationHead,
+    CellGATClassificationHead,
+    CellGraphClassificationHead,
+    EMCellGraphClassificationHead,
+)
 from model.gene_graph import build_gene_graph
-from model.gnn import build_gene_gat
+from model.gnn import build_gene_gat, GlobalCellGraph
 from train.config import DataConfig, ModelConfig, FinetuneConfig
 from train.pretrain import get_cosine_schedule_with_warmup
 from eval.metrics import collect_predictions, compute_metrics, _forward_head
@@ -105,6 +111,27 @@ def _get_device() -> torch.device:
     return torch.device("cpu")
 
 
+@torch.no_grad()
+def _refresh_graph(encoder, train_loader_seq, test_loader, device, n_total: int,
+                    global_graph: GlobalCellGraph) -> None:
+    """
+    The "E-step": takes a full-fold CLS embedding snapshot (train + test
+    combined, transductive — test structure visible, test labels never used)
+    and rebuilds GlobalCellGraph's neighbor cache from it. Embeddings are
+    scattered into (n_total, hidden_dim) at each sample's own "idx", so this
+    is correct regardless of loader shuffling or batch order.
+    """
+    encoder.eval()
+    out = torch.zeros(n_total, encoder.hidden_dim, device=device)
+    for loader in (train_loader_seq, test_loader):
+        for batch in loader:
+            ids  = batch["input_ids"].to(device)
+            amsk = batch["attention_mask"].to(device)
+            idx  = batch["idx"].to(device)
+            out[idx] = encoder.get_cls_embedding(ids, amsk)
+    global_graph.refresh(out)
+
+
 def train_one_fold(
     train_adata,
     test_adata,
@@ -126,10 +153,19 @@ def train_one_fold(
         a.obs["cell_type"] = a.obs["cell_type"].cat.set_categories(all_cats)
     num_classes = len(all_cats)
 
+    # EM cell graph (Option C2) is transductive: it needs a full-dataset view
+    # of the FOLD's cells (train + test) to build each cell's TRUE nearest
+    # neighbors, not just whichever cells share a training batch. Test cells'
+    # STRUCTURE is visible (their embeddings), never their labels — same
+    # convention as standard transductive GNN training. index_offset gives
+    # train and test disjoint index ranges so one combined embedding tensor
+    # can be queried consistently by either split's "idx".
+    n_train = train_adata.n_obs
     train_ds = scRNADataset(train_adata, max_seq_len=data_cfg.max_seq_len,
                             mask_ratio=data_cfg.mask_ratio, mode="finetune")
     test_ds  = scRNADataset(test_adata,  max_seq_len=data_cfg.max_seq_len,
-                            mask_ratio=data_cfg.mask_ratio, mode="finetune")
+                            mask_ratio=data_cfg.mask_ratio, mode="finetune",
+                            index_offset=n_train)
 
     train_loader = DataLoader(train_ds, batch_size=ft_cfg.batch_size,
                               shuffle=True, num_workers=data_cfg.num_workers,
@@ -137,6 +173,11 @@ def train_one_fold(
     test_loader  = DataLoader(test_ds,  batch_size=ft_cfg.batch_size,
                               shuffle=False, num_workers=data_cfg.num_workers,
                               pin_memory=device.type == "cuda")
+    # Unshuffled train loader for embedding snapshots — order doesn't
+    # actually matter (scattered by "idx"), but avoids reshuffling overhead.
+    train_loader_seq = DataLoader(train_ds, batch_size=ft_cfg.batch_size,
+                                  shuffle=False, num_workers=data_cfg.num_workers,
+                                  pin_memory=device.type == "cuda")
 
     vocab_size = train_ds.vocab_size
     encoder = scRNAEncoder(
@@ -154,6 +195,7 @@ def train_one_fold(
         ckpt = torch.load(pretrain_ckpt, map_location=device)
         encoder.load_state_dict(ckpt["encoder_state"], strict=False)
 
+    global_graph = None
     if model_cfg.use_gat_head and ppi_edge_index is not None:
         head = CellGATClassificationHead(
             hidden_dim=model_cfg.hidden_dim,
@@ -172,6 +214,17 @@ def train_one_fold(
             k=model_cfg.cell_graph_k,
             n_heads=model_cfg.cell_graph_heads,
         ).to(device)
+    elif model_cfg.use_em_cell_graph:
+        head = EMCellGraphClassificationHead(
+            hidden_dim=model_cfg.hidden_dim,
+            num_classes=num_classes,
+            dropout=model_cfg.dropout,
+        ).to(device)
+        global_graph = GlobalCellGraph(k=model_cfg.em_graph_k)
+        head.graph = global_graph  # looked up by eval/metrics.py's _forward_head
+        n_total = n_train + test_adata.n_obs
+        # Initial E-step, before any training — from the loaded (or random) encoder.
+        _refresh_graph(encoder, train_loader_seq, test_loader, device, n_total, global_graph)
     else:
         head = CellTypeClassificationHead(
             hidden_dim=model_cfg.hidden_dim,
@@ -193,9 +246,10 @@ def train_one_fold(
             ids  = batch["input_ids"].to(device)
             amsk = batch["attention_mask"].to(device)
             ct   = batch["cell_type"].to(device)
+            idx  = batch["idx"].to(device) if global_graph is not None else None
             optimizer.zero_grad()
             with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled()):
-                loss, _ = _forward_head(encoder, head, ids, amsk, ct)
+                loss, _ = _forward_head(encoder, head, ids, amsk, ct, idx=idx)
             params = list(encoder.parameters()) + list(head.parameters())
             if scaler.is_enabled():
                 scaler.scale(loss).backward()
@@ -208,6 +262,13 @@ def train_one_fold(
                 torch.nn.utils.clip_grad_norm_(params, ft_cfg.grad_clip)
                 optimizer.step()
             scheduler.step()
+
+        # E-step: rebuild the full-dataset graph from the now-updated encoder,
+        # every em_graph_refresh_every epochs (M-step is the training above,
+        # which used whatever graph was current at the time).
+        if global_graph is not None and epoch % model_cfg.em_graph_refresh_every == 0:
+            n_total = n_train + test_adata.n_obs
+            _refresh_graph(encoder, train_loader_seq, test_loader, device, n_total, global_graph)
 
     preds, labels = collect_predictions(encoder, head, test_loader, device)
     metrics = compute_metrics(preds, labels, all_cats)
@@ -226,7 +287,12 @@ def evaluate_dataset(
     gnn_label = "none"
     if model_cfg.use_gnn:
         gnn_label = "frozen" if model_cfg.gnn_freeze else "joint"
-    head_label = "GAT" if model_cfg.use_gat_head else "CellGraph" if model_cfg.use_cell_graph else "CLS"
+    head_label = (
+        "GAT" if model_cfg.use_gat_head else
+        "CellGraph" if model_cfg.use_cell_graph else
+        "EMCellGraph" if model_cfg.use_em_cell_graph else
+        "CLS"
+    )
     print(f"\n{'='*60}")
     print(f"Dataset: {name}  ({k}-fold CV)  head={head_label}  gnn={gnn_label}")
     print(f"{'='*60}")
@@ -331,10 +397,11 @@ def main():
                         help="Path to pretrained encoder checkpoint")
     parser.add_argument("--k", type=int, default=5, help="Number of CV folds")
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--head", choices=["cls", "gat", "cellgraph"], default="cls",
+    parser.add_argument("--head", choices=["cls", "gat", "cellgraph", "emcellgraph"], default="cls",
                         help="cls = [CLS] linear probe; gat = CellGAT (gene-level PPI graph "
                              "during classification, Option B); cellgraph = CellGraph "
-                             "(cell-cell k-NN graph during classification, Option C)")
+                             "(batch-level cell-cell k-NN graph, Option C); emcellgraph = "
+                             "EMCellGraph (full-dataset, EM-refined cell-cell graph, Option C2)")
     parser.add_argument("--gnn", choices=["none", "frozen", "joint"], default="none",
                         help="none = plain nn.Embedding; frozen/joint = GeneGAT gene embeddings (Option A)")
     args = parser.parse_args()
@@ -343,6 +410,7 @@ def main():
     model_cfg  = ModelConfig(
         use_gat_head=(args.head == "gat"),
         use_cell_graph=(args.head == "cellgraph"),
+        use_em_cell_graph=(args.head == "emcellgraph"),
         use_gnn=(args.gnn != "none"),
         gnn_freeze=(args.gnn == "frozen"),
     )

@@ -54,6 +54,7 @@ class scRNADataset(Dataset):
         n_bins: int = 10,
         panel: np.ndarray | None = None,
         bin_edges: np.ndarray | None = None,
+        index_offset: int = 0,
     ):
         if tokenization not in ("rank", "expr_bin"):
             raise ValueError(f"Unknown tokenization: {tokenization!r}")
@@ -63,6 +64,11 @@ class scRNADataset(Dataset):
         self.tokenization = tokenization
         self.n_bins = n_bins
         self.n_genes = adata.n_vars  # vocabulary size before special tokens
+        # Added to __getitem__'s "idx" — lets two datasets built from disjoint
+        # splits (e.g. train/test) share one combined index space, so a
+        # GlobalCellGraph built over both can be queried consistently
+        # regardless of which split a given cell came from.
+        self.index_offset = index_offset
 
         # Convert to dense numpy array for fast per-cell access
         X = adata.X
@@ -156,6 +162,7 @@ class scRNADataset(Dataset):
             "input_ids": torch.tensor(input_ids),
             "attention_mask": torch.tensor(attention_mask),
             "labels": torch.tensor(labels),
+            "idx": torch.tensor(idx + self.index_offset, dtype=torch.long),
         }
 
         if self.mode == "finetune" and self.cell_type_labels is not None:
@@ -190,6 +197,7 @@ class scRNADataset(Dataset):
             "bin_ids": torch.tensor(bin_ids),
             "attention_mask": torch.tensor(attention_mask),
             "labels": torch.tensor(labels),
+            "idx": torch.tensor(idx + self.index_offset, dtype=torch.long),
         }
 
         if self.mode == "finetune" and self.cell_type_labels is not None:

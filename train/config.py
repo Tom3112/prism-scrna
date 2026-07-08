@@ -53,6 +53,11 @@ class ModelConfig:
     cell_graph_k: int = 5               # neighbors per cell in the k-NN graph
     cell_graph_heads: int = 4           # attention heads in the cell-cell GAT
 
+    # Cell-cell GNN, EM-refined (Option C2 — full-dataset graph, not batch-level)
+    use_em_cell_graph: bool = False      # True = EMCellGraphClassificationHead
+    em_graph_k: int = 5                  # neighbors per cell in the full-dataset graph
+    em_graph_refresh_every: int = 1      # rebuild the graph every N epochs (the "E-step")
+
 
 @dataclass
 class PretrainConfig:

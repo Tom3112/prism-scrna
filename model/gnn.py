@@ -249,6 +249,63 @@ class CellCellGAT(nn.Module):
         return self.norm(cell_emb + delta)
 
 
+class GlobalCellGraph:
+    """
+    Full-dataset cell-cell k-NN graph, periodically refreshed — the "E-step"
+    of an EM-style refinement loop. This is what CellCellGAT approximates at
+    batch scale: instead of a k-NN graph over whichever cells happen to
+    share a training minibatch, `refresh()` computes each cell's TRUE
+    nearest neighbors across the ENTIRE training split, from a full-dataset
+    embedding snapshot taken with the current encoder.
+
+    Call `refresh(embeddings)` once before training and again periodically
+    (e.g. every epoch) as the encoder improves — each refresh is the E-step
+    (rebuild the graph from current understanding); the training steps that
+    follow, using that fixed graph, are the M-step. Neighbor embeddings are
+    cached (detached) between refreshes, so no gradient flows through
+    "which cells are neighbors," same convention as `_build_knn_graph`.
+
+    Not a drop-in nn.Module — this is plain host-side state, not a layer,
+    since it needs to persist and mutate across an entire epoch rather than
+    being reconstructed per forward pass.
+    """
+
+    def __init__(self, k: int = 5):
+        self.k = k
+        self.neighbor_emb: torch.Tensor | None = None  # (N, k, D), detached
+
+    @torch.no_grad()
+    def refresh(self, embeddings: torch.Tensor) -> None:
+        """
+        embeddings: (N, D) full-dataset snapshot, in dataset-index order
+        (index i must correspond to the same cell scRNADataset.__getitem__(i)
+        would return as "idx": i). Rebuilds neighbor cache via cosine
+        similarity. Chunked to avoid an O(N^2) memory blowup on large
+        datasets (e.g. Zheng68K's ~53k training cells).
+        """
+        N = embeddings.size(0)
+        k = min(self.k, N - 1)
+        norm = F.normalize(embeddings, dim=-1)
+        chunk = 2048
+        idx_chunks = []
+        for start in range(0, N, chunk):
+            end = min(start + chunk, N)
+            sim = norm[start:end] @ norm.t()                     # (chunk, N)
+            rows = torch.arange(end - start, device=embeddings.device)
+            cols = torch.arange(start, end, device=embeddings.device)
+            sim[rows, cols] = -float("inf")                       # exclude self
+            _, topk = sim.topk(k, dim=-1)                          # (chunk, k)
+            idx_chunks.append(topk)
+        neighbor_idx = torch.cat(idx_chunks, dim=0)                # (N, k)
+        self.neighbor_emb = embeddings[neighbor_idx].detach()      # (N, k, D)
+
+    def get_neighbors(self, dataset_indices: torch.Tensor) -> torch.Tensor:
+        """dataset_indices: (B,) -> (B, k, D) cached neighbor embeddings."""
+        if self.neighbor_emb is None:
+            raise RuntimeError("GlobalCellGraph.refresh() must be called before get_neighbors()")
+        return self.neighbor_emb[dataset_indices.to(self.neighbor_emb.device)]
+
+
 def build_gene_gat(
     model_cfg,
     processed_path: str,
