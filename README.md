@@ -276,12 +276,37 @@ CellGraph lands in baseline/CellGAT territory — slightly *below* both, not abo
 and the gap to HNNVAT barely moves (▼11.2pp vs baseline's ▼10.5pp). This confirms
 the caveat flagged before running it: a batch-level k-NN graph, rebuilt fresh every
 forward pass with no EM refinement, isn't the same thing as HNNVAT's or scBiGNN's
-actual full-dataset cell-cell graph. **The finding narrows, not widens:** cell-cell
-structure *may* still be what closes this gap, but only if it's a real,
-persistent, dataset-wide graph — not any cell-cell attention mechanism at all. A
-precomputed full-dataset k-NN graph (rebuilt periodically across epochs rather than
-per-batch) is the next thing to try before concluding cell-cell structure doesn't
-help here.
+actual full-dataset cell-cell graph.
+
+**Follow-up: built the real thing (Option C2), and it's worse, not better.**
+`EMCellGraphClassificationHead` + `GlobalCellGraph` (`model/gnn.py`) implement an
+actual full-dataset, EM-style refinement: a full train+test CLS-embedding snapshot
+(transductive — structure visible, labels never used) rebuilds each cell's true
+k-nearest-neighbor cache every epoch (the "E-step"), and training between refreshes
+(the "M-step") attends over those real neighbors instead of batchmates.
+
+| Variant | Accuracy |
+|---|---|
+| Baseline | 0.8210 |
+| CellGAT (Option B) | 0.8200 |
+| CellGraph (Option C, batch-level) | 0.8162 ± 0.0035 |
+| **EMCellGraph (Option C2, full-dataset EM)** | **0.8125 ± 0.0109** |
+| GNN frozen (Option A) | 0.7517 |
+| GNN joint (Option A) | 0.7436 |
+| HNNVAT | **0.926** |
+
+The theoretically more correct version is *worse*: lower mean than the batch-level
+approximation, over 3x the std (0.0109 vs 0.0035 — less stable across folds), and
+~2.2x the wall-clock cost (extra full-dataset forward pass every epoch for the
+refresh). **Cell-cell structure alone isn't what's missing** — three different ways
+of adding it (frozen gene-graph-adjacent, batch cell graph, full-dataset EM cell
+graph) all land at or below baseline on this dataset, none within 10 points of
+HNNVAT. The likely difference isn't "does a cell-cell graph exist" but *how*
+HNNVAT builds and uses one: its adversarial dense-GCN training and label-informed
+refinement are architecturally distinct from a plain k-NN-over-embeddings graph,
+which is what all three PRISM attempts here amount to. Next step, if this is
+pursued further, is closer architectural imitation of HNNVAT itself rather than
+another cosine-similarity graph variant.
 
 Notes:
 - The 5 scBiGNN baselines are verified exact matches against Ma et al.'s scBiGNN paper
