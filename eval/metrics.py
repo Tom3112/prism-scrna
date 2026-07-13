@@ -15,16 +15,27 @@ from sklearn.metrics import (
 )
 
 from model.transformer import scRNAEncoder
-from model.heads import CellTypeClassificationHead, CellGATClassificationHead
+from model.heads import CellTypeClassificationHead, CellGATClassificationHead, EMCellGraphClassificationHead
 
 
-def _forward_head(encoder, head, input_ids, attention_mask, labels=None):
-    """Unified forward pass for CLS head and GAT head."""
+def _forward_head(encoder, head, input_ids, attention_mask, labels=None, bin_ids=None, idx=None):
+    """
+    Unified forward pass for CLS, GAT, and EM-cell-graph heads.
+
+    EMCellGraphClassificationHead expects an externally-refreshed
+    `head.graph` (a GlobalCellGraph instance, attached by the caller after
+    construction) plus each batch's dataset-index tensor (`idx`) to look up
+    cached neighbor embeddings.
+    """
     if isinstance(head, CellGATClassificationHead):
-        hidden = encoder(input_ids, attention_mask)
+        hidden = encoder(input_ids, attention_mask, bin_ids)
         return head(hidden, attention_mask, input_ids, labels)
+    elif isinstance(head, EMCellGraphClassificationHead):
+        cls_emb = encoder.get_cls_embedding(input_ids, attention_mask, bin_ids)
+        neighbor_emb = head.graph.get_neighbors(idx)
+        return head(cls_emb, neighbor_emb, labels)
     else:
-        cls_emb = encoder.get_cls_embedding(input_ids, attention_mask)
+        cls_emb = encoder.get_cls_embedding(input_ids, attention_mask, bin_ids)
         return head(cls_emb, labels)
 
 
@@ -40,12 +51,16 @@ def collect_predictions(
     head.eval()
     preds_list, labels_list = [], []
 
+    amp_enabled = device.type == "cuda"
     for batch in loader:
         input_ids      = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         cell_type      = batch["cell_type"].to(device)
+        bin_ids        = batch["bin_ids"].to(device) if "bin_ids" in batch else None
+        idx            = batch["idx"].to(device) if "idx" in batch else None
 
-        _, logits = _forward_head(encoder, head, input_ids, attention_mask)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            _, logits = _forward_head(encoder, head, input_ids, attention_mask, bin_ids=bin_ids, idx=idx)
         preds_list.append(logits.argmax(dim=-1).cpu().numpy())
         labels_list.append(cell_type.cpu().numpy())
 
@@ -57,15 +72,27 @@ def compute_metrics(
     labels: np.ndarray,
     label_names: list[str] | None = None,
 ) -> dict:
+    # Explicit `labels=` keeps class count/order fixed at len(label_names) even
+    # when a fold has zero test examples of some (rare) class — without it,
+    # sklearn infers the class set from what actually appears in this fold,
+    # which silently shrinks per_class_f1/confusion_matrix and crashes
+    # classification_report's target_names length check.
+    all_labels = np.arange(len(label_names)) if label_names is not None else None
+
     acc = accuracy_score(labels, preds)
-    macro_f1 = f1_score(labels, preds, average="macro", zero_division=0)
-    per_class_f1 = f1_score(labels, preds, average=None, zero_division=0)
-    cm = confusion_matrix(labels, preds)
-    report = classification_report(labels, preds, target_names=label_names, zero_division=0)
+    macro_f1 = f1_score(labels, preds, labels=all_labels, average="macro", zero_division=0)
+    per_class_f1 = f1_score(labels, preds, labels=all_labels, average=None, zero_division=0)
+    # Median (not mean) of per-class F1 — the metric Abdelaal et al. 2019 (source
+    # of this benchmark suite) use as their primary score specifically because it's
+    # robust to one or two badly-performing rare classes dragging down a macro-average.
+    median_f1 = float(np.median(per_class_f1))
+    cm = confusion_matrix(labels, preds, labels=all_labels)
+    report = classification_report(labels, preds, labels=all_labels, target_names=label_names, zero_division=0)
 
     return {
         "accuracy": acc,
         "macro_f1": macro_f1,
+        "median_f1": median_f1,
         "per_class_f1": per_class_f1,
         "confusion_matrix": cm,
         "classification_report": report,

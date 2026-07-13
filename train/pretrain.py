@@ -18,6 +18,7 @@ from tqdm import tqdm
 
 from data.dataset import load_datasets
 from model.transformer import scRNAEncoder
+from model.gnn import build_gene_gat
 from model.heads import MaskedGenePredictionHead
 from train.config import DataConfig, ModelConfig, PretrainConfig
 
@@ -66,26 +67,39 @@ def train_epoch(
     scheduler: LambdaLR,
     device: torch.device,
     grad_clip: float,
+    scaler: torch.cuda.amp.GradScaler | None = None,
 ) -> tuple[float, float]:
     encoder.train()
     head.train()
     total_loss = 0.0
     total_acc = 0.0
+    amp_enabled = scaler is not None and scaler.is_enabled()
 
     for batch in tqdm(loader, desc="  train", leave=False):
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
-
-        hidden = encoder(input_ids, attention_mask)
-        loss, logits = head(hidden, labels)
+        bin_ids = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
         optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(
-            list(encoder.parameters()) + list(head.parameters()), grad_clip
-        )
-        optimizer.step()
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            hidden = encoder(input_ids, attention_mask, bin_ids)
+            loss, logits = head(hidden, labels)
+
+        if amp_enabled:
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(head.parameters()), grad_clip
+            )
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(
+                list(encoder.parameters()) + list(head.parameters()), grad_clip
+            )
+            optimizer.step()
         scheduler.step()
 
         total_loss += loss.item()
@@ -101,6 +115,7 @@ def val_epoch(
     head: MaskedGenePredictionHead,
     loader: DataLoader,
     device: torch.device,
+    amp_enabled: bool = False,
 ) -> tuple[float, float]:
     encoder.eval()
     head.eval()
@@ -111,9 +126,11 @@ def val_epoch(
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
+        bin_ids = batch["bin_ids"].to(device) if "bin_ids" in batch else None
 
-        hidden = encoder(input_ids, attention_mask)
-        loss, logits = head(hidden, labels)
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_enabled):
+            hidden = encoder(input_ids, attention_mask, bin_ids)
+            loss, logits = head(hidden, labels)
 
         total_loss += loss.item()
         total_acc += masked_accuracy(logits, labels)
@@ -158,6 +175,8 @@ def pretrain(
         train_frac=data_cfg.train_frac,
         val_frac=data_cfg.val_frac,
         seed=data_cfg.seed,
+        tokenization=data_cfg.tokenization,
+        n_bins=data_cfg.n_bins,
     )
     vocab_size = splits["vocab_size"]
     print(f"Vocab size: {vocab_size}  |  Train cells: {len(splits['pretrain_train'])}  |  Val cells: {len(splits['pretrain_val'])}")
@@ -178,6 +197,11 @@ def pretrain(
     )
 
     # Model
+    gene_gat = None
+    if model_cfg.use_gnn:
+        print("Building PPI graph for GeneGAT gene embeddings...")
+        gene_gat = build_gene_gat(model_cfg, data_cfg.processed_path, device)
+
     encoder = scRNAEncoder(
         vocab_size=vocab_size,
         hidden_dim=model_cfg.hidden_dim,
@@ -186,8 +210,14 @@ def pretrain(
         ffn_dim=model_cfg.ffn_dim,
         dropout=model_cfg.dropout,
         max_seq_len=data_cfg.max_seq_len,
+        n_expr_bins=(data_cfg.n_bins if data_cfg.tokenization == "expr_bin" else None),
+        gene_gat=gene_gat,
     ).to(device)
-    head = MaskedGenePredictionHead(model_cfg.hidden_dim, vocab_size).to(device)
+    # expr_bin mode predicts the masked expression bin (0..n_bins); gene identity
+    # is always visible (fixed panel), so predicting it would be trivial from
+    # position alone. rank mode predicts the masked gene identity as usual.
+    n_pred_classes = (data_cfg.n_bins + 1) if data_cfg.tokenization == "expr_bin" else vocab_size
+    head = MaskedGenePredictionHead(model_cfg.hidden_dim, n_pred_classes).to(device)
 
     n_params = sum(p.numel() for p in encoder.parameters()) + sum(p.numel() for p in head.parameters())
     print(f"Model parameters: {n_params:,}")
@@ -200,6 +230,7 @@ def pretrain(
     )
     total_steps = cfg.epochs * len(train_loader)
     scheduler = get_cosine_schedule_with_warmup(optimizer, cfg.warmup_steps, total_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     # Training loop
     best_val_loss = float("inf")
@@ -208,9 +239,9 @@ def pretrain(
     for epoch in range(1, cfg.epochs + 1):
         t0 = time.time()
         train_loss, train_acc = train_epoch(
-            encoder, head, train_loader, optimizer, scheduler, device, cfg.grad_clip
+            encoder, head, train_loader, optimizer, scheduler, device, cfg.grad_clip, scaler
         )
-        val_loss, val_acc = val_epoch(encoder, head, val_loader, device)
+        val_loss, val_acc = val_epoch(encoder, head, val_loader, device, amp_enabled=scaler.is_enabled())
         elapsed = time.time() - t0
 
         history["train_loss"].append(train_loss)

@@ -1,16 +1,23 @@
 """
-Download the 5 standard cell-type annotation benchmark datasets from Zenodo.
+Download the 7 standard cell-type annotation benchmark datasets from Zenodo.
 
 Source: Abdelaal et al. (2019) "A comparison of automatic cell identification methods
         for single-cell RNA sequencing data." Genome Biology.
 Zenodo: https://doi.org/10.5281/zenodo.3357167
 
-Datasets included:
+Datasets included (all from the same Zenodo archive):
   - BaronHuman   : human pancreas,    8,569 cells,  14 types
   - BaronMouse   : mouse pancreas,    1,886 cells,  13 types
-  - AMB          : mouse visual cortex, 12,832 cells, 22 types (subset)
+  - AMB          : mouse visual cortex, 12,832 cells, 22 types (Subclass column)
   - Zheng68K     : human PBMC,       65,943 cells,  11 types
   - Zhengsorted  : human PBMC (FACS), 20,000 cells, 10 types
+  - Segerstolpe  : human pancreas,    2,133 cells,  13 types
+  - Muraro       : human pancreas,    2,122 cells,   9 types
+
+Zeisel, Macosko, and Klein are NOT part of this Zenodo record (verified by
+listing its full archive contents) and are not fetched here — see README.md's
+Benchmarks section for why they were dropped from the comparison entirely
+rather than reported without a source.
 
 Usage:
     uv run python data/download_benchmarks.py
@@ -18,43 +25,69 @@ Usage:
 
 from __future__ import annotations
 
-import io
 import os
-import tarfile
+import shutil
 import zipfile
-import urllib.request
 from pathlib import Path
 
 import anndata as ad
 import numpy as np
+import pandas as pd
+import scipy.sparse as sp
 
-ZENODO_URL  = "https://zenodo.org/records/3357167/files/scRNAseq_Benchmark_datasets.zip?download=1"
-BENCH_DIR   = os.path.join(os.path.dirname(__file__), "..", "data", "benchmarks")
-ZIP_CACHE   = os.path.join(BENCH_DIR, "_zenodo_raw.zip")
+ZENODO_URL = "https://zenodo.org/records/3357167/files/scRNAseq_Benchmark_datasets.zip?download=1"
+BENCH_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "benchmarks")
+ZIP_CACHE = os.path.join(BENCH_DIR, "_zenodo_raw.zip")
 
-DATASETS = [
-    # Original 5 (used by scBiGNN)
-    "BaronHuman", "BaronMouse", "AMB", "Zheng_68K", "Zhengsorted",
-    # Extended 5 (all from same Zenodo archive, used by Abdelaal et al. 2019)
-    "Zeisel",       # mouse brain,          ~3,000 cells,  9 types
-    "Segerstolpe",  # human pancreas,       ~2,300 cells, 14 types
-    "Muraro",       # human pancreas,       ~2,100 cells,  9 types
-    "Macosko",      # mouse retina,        ~44,000 cells, 39 types
-    "Klein",        # mouse ESC timecourse,  ~2,400 cells,  4 types
-]
+CHUNK_ROWS = 2000  # rows per chunk when streaming large CSVs into a sparse matrix
 
-# Canonical output names
-CANONICAL = {
-    "BaronHuman":  "baron_human.h5ad",
-    "BaronMouse":  "baron_mouse.h5ad",
-    "AMB":         "amb.h5ad",
-    "Zheng_68K":   "zheng68k.h5ad",
-    "Zhengsorted": "zhengsorted.h5ad",
-    "Zeisel":      "zeisel.h5ad",
-    "Segerstolpe": "segerstolpe.h5ad",
-    "Muraro":      "muraro.h5ad",
-    "Macosko":     "macosko.h5ad",
-    "Klein":       "klein.h5ad",
+# Real paths inside the Zenodo zip (verified by listing the archive — the
+# top-level dataset names in DATASETS/CANONICAL below don't appear verbatim as
+# folder names; several have spaces or live under Pancreatic_data/).
+DATASET_SPECS = {
+    "BaronHuman": dict(
+        out="baron_human.h5ad",
+        dir="Intra-dataset/Pancreatic_data/Baron Human",
+        expr="Filtered_Baron_HumanPancreas_data.csv",
+        labels="Labels.csv",
+    ),
+    "BaronMouse": dict(
+        out="baron_mouse.h5ad",
+        dir="Intra-dataset/Pancreatic_data/Baron Mouse",
+        expr="Filtered_MousePancreas_data.csv",
+        labels="Labels.csv",
+    ),
+    "AMB": dict(
+        out="amb.h5ad",
+        dir="Intra-dataset/AMB",
+        expr="Filtered_mouse_allen_brain_data.csv",
+        labels="Labels.csv",
+        label_col="Subclass",  # Class=4, Subclass=22, cluster=110 — 22 matches our doc
+    ),
+    "Zheng68K": dict(
+        out="zheng68k.h5ad",
+        dir="Intra-dataset/Zheng 68K",
+        expr="Filtered_68K_PBMC_data.csv",
+        labels="Labels.csv",
+    ),
+    "Zhengsorted": dict(
+        out="zhengsorted.h5ad",
+        dir="Intra-dataset/Zheng sorted",
+        expr="Filtered_DownSampled_SortedPBMC_data.csv",
+        labels="Labels.csv",
+    ),
+    "Segerstolpe": dict(
+        out="segerstolpe.h5ad",
+        dir="Intra-dataset/Pancreatic_data/Segerstolpe",
+        expr="Filtered_Segerstolpe_HumanPancreas_data.csv",
+        labels="Labels.csv",
+    ),
+    "Muraro": dict(
+        out="muraro.h5ad",
+        dir="Intra-dataset/Pancreatic_data/Muraro",
+        expr="Filtered_Muraro_HumanPancreas_data.csv",
+        labels="Labels.csv",
+    ),
 }
 
 
@@ -64,6 +97,8 @@ def _progress_hook(count, block_size, total_size):
 
 
 def _ensure_zip():
+    import urllib.request
+
     os.makedirs(BENCH_DIR, exist_ok=True)
     if os.path.exists(ZIP_CACHE):
         print(f"Zenodo zip already cached at {ZIP_CACHE}")
@@ -73,134 +108,75 @@ def _ensure_zip():
     print()
 
 
+def _read_expr_csv_sparse(path: str, chunksize: int = CHUNK_ROWS):
+    """
+    Stream a (cells x genes) CSV into a sparse CSR matrix in row chunks, so
+    peak memory stays around one chunk's dense size instead of the whole
+    matrix (some of these files are 65,943 x 20,387 dense floats — reading
+    them whole with pandas' default float64 plus a float32 cast copy
+    exceeds available RAM). Index column = cell barcode, header = gene name;
+    rows are always cells for this dataset collection (not auto-detected —
+    verified directly against known cell counts per dataset).
+    """
+    # Passing a bare dtype together with index_col confuses pandas' C parser
+    # into trying to cast the (string) index column too — build an explicit
+    # per-column dtype dict from the header instead, keyed by gene name.
+    with open(path) as f:
+        header = next(f).rstrip("\n").split(",")
+    gene_cols = [c.strip('"') for c in header[1:]]
+    dtype_map = {c: np.float32 for c in gene_cols}
+
+    chunks = []
+    obs_names: list[str] = []
+    var_names = None
+    for chunk in pd.read_csv(path, index_col=0, dtype=dtype_map, chunksize=chunksize):
+        if var_names is None:
+            var_names = chunk.columns.astype(str).tolist()
+        chunks.append(sp.csr_matrix(chunk.values))
+        obs_names.extend(chunk.index.astype(str).tolist())
+    X = sp.vstack(chunks, format="csr")
+    return X, obs_names, var_names
+
+
 def _extract_datasets():
-    """
-    Extract only the 5 target datasets from the zip.
-    The zip structure is: scRNAseq_Benchmark_datasets/<DatasetName>/<DatasetName>_*.loom or .csv
-    We read each into AnnData and save as h5ad.
-    """
-    import scanpy as sc
-
     with zipfile.ZipFile(ZIP_CACHE, "r") as zf:
-        names = zf.namelist()
-
-        for dataset, out_name in CANONICAL.items():
-            out_path = os.path.join(BENCH_DIR, out_name)
+        for dataset, spec in DATASET_SPECS.items():
+            out_path = os.path.join(BENCH_DIR, spec["out"])
             if os.path.exists(out_path):
-                print(f"  {out_name} already exists — skipping.")
+                print(f"  {spec['out']} already exists — skipping.")
                 continue
 
-            # Find matching files in the zip
-            matches = [n for n in names if f"/{dataset}/" in n and not n.endswith("/")]
-            if not matches:
-                print(f"  WARNING: {dataset} not found in zip. Files available: "
-                      f"{[n for n in names if dataset.lower() in n.lower()[:60]]}")
-                continue
+            expr_zip_path = f"{spec['dir']}/{spec['expr']}"
+            labels_zip_path = f"{spec['dir']}/{spec['labels']}"
 
-            print(f"  Extracting {dataset} ({len(matches)} files)...")
-
-            # Extract to temp dir
+            print(f"  Extracting {dataset}...")
             tmp_dir = os.path.join(BENCH_DIR, f"_tmp_{dataset}")
             os.makedirs(tmp_dir, exist_ok=True)
-            for fname in matches:
-                zf.extract(fname, tmp_dir)
+            zf.extract(expr_zip_path, tmp_dir)
+            zf.extract(labels_zip_path, tmp_dir)
 
-            # Find the actual file and load it
-            adata = _load_dataset(tmp_dir, dataset)
-            if adata is not None:
-                adata.write_h5ad(out_path)
-                print(f"  Saved {adata.n_obs} cells × {adata.n_vars} genes → {out_name}")
+            expr_file = os.path.join(tmp_dir, expr_zip_path)
+            labels_file = os.path.join(tmp_dir, labels_zip_path)
 
-            # Clean up temp
-            import shutil
+            print(f"    Reading {spec['expr']} (chunked, sparse)...")
+            X, obs_names, var_names = _read_expr_csv_sparse(expr_file)
+
+            adata = ad.AnnData(
+                X=X,
+                obs=pd.DataFrame(index=obs_names),
+                var=pd.DataFrame(index=var_names),
+            )
+
+            labels_df = pd.read_csv(labels_file)
+            label_col = spec.get("label_col", labels_df.columns[0])
+            adata.obs["cell_type"] = labels_df[label_col].astype("category").values
+
+            adata.write_h5ad(out_path)
+            n_types = adata.obs["cell_type"].nunique()
+            print(f"  Saved {adata.n_obs:,} cells x {adata.n_vars:,} genes, "
+                  f"{n_types} types -> {spec['out']}")
+
             shutil.rmtree(tmp_dir)
-
-
-def _load_dataset(tmp_dir: str, dataset: str) -> ad.AnnData | None:
-    """Load a dataset from its extracted files into AnnData."""
-    import scanpy as sc
-    from pathlib import Path
-
-    files = list(Path(tmp_dir).rglob("*"))
-    files = [f for f in files if f.is_file()]
-
-    # Try loom first
-    loom_files = [f for f in files if f.suffix == ".loom"]
-    if loom_files:
-        adata = sc.read_loom(str(loom_files[0]))
-        # Standardise cell type column
-        _standardise_labels(adata, dataset)
-        return adata
-
-    # Try h5ad
-    h5ad_files = [f for f in files if f.suffix == ".h5ad"]
-    if h5ad_files:
-        adata = sc.read_h5ad(str(h5ad_files[0]))
-        _standardise_labels(adata, dataset)
-        return adata
-
-    # Try CSV (expression matrix + labels separate)
-    csv_files = [f for f in files if f.suffix == ".csv"]
-    if csv_files:
-        return _load_from_csv(csv_files, dataset)
-
-    # Try txt/tsv
-    tsv_files = [f for f in files if f.suffix in (".txt", ".tsv")]
-    if tsv_files:
-        return _load_from_csv(tsv_files, dataset)
-
-    print(f"  Could not load {dataset}: no recognised format among {[f.name for f in files]}")
-    return None
-
-
-def _load_from_csv(files, dataset: str) -> ad.AnnData | None:
-    import pandas as pd
-
-    expr_file  = next((f for f in files if "expr" in f.name.lower() or
-                       "count" in f.name.lower() or "matrix" in f.name.lower()), None)
-    label_file = next((f for f in files if "label" in f.name.lower() or
-                       "cell_type" in f.name.lower() or "annot" in f.name.lower()), None)
-
-    if expr_file is None:
-        # Fallback: largest file is expression matrix
-        expr_file = max(files, key=lambda f: f.stat().st_size)
-
-    print(f"    Reading expression from {expr_file.name}")
-    expr = pd.read_csv(str(expr_file), index_col=0)
-
-    # Assume cells are rows if n_rows > n_cols, else transpose
-    if expr.shape[0] < expr.shape[1]:
-        expr = expr.T
-
-    adata = ad.AnnData(X=expr.values.astype("float32"),
-                       obs=pd.DataFrame(index=expr.index),
-                       var=pd.DataFrame(index=expr.columns))
-
-    if label_file is not None:
-        print(f"    Reading labels from {label_file.name}")
-        labels = pd.read_csv(str(label_file), index_col=0, header=None).squeeze()
-        adata.obs["cell_type"] = labels.values if len(labels) == adata.n_obs else "Unknown"
-
-    _standardise_labels(adata, dataset)
-    return adata
-
-
-def _standardise_labels(adata: ad.AnnData, dataset: str):
-    """Ensure cell_type column exists and is a category."""
-    label_candidates = ["cell_type", "CellType", "celltype", "label",
-                        "Cluster", "cluster", "Annotation"]
-    for col in label_candidates:
-        if col in adata.obs.columns:
-            if col != "cell_type":
-                adata.obs["cell_type"] = adata.obs[col]
-            break
-
-    if "cell_type" not in adata.obs.columns:
-        print(f"    WARNING: no cell_type column found for {dataset}. "
-              f"Obs columns: {list(adata.obs.columns)}")
-        adata.obs["cell_type"] = "Unknown"
-
-    adata.obs["cell_type"] = adata.obs["cell_type"].astype("category")
 
 
 def download_all():
@@ -208,15 +184,15 @@ def download_all():
     print("Extracting target datasets...")
     _extract_datasets()
     print("\nDone. Available benchmark datasets:")
-    for name, fname in CANONICAL.items():
-        path = os.path.join(BENCH_DIR, fname)
+    for dataset, spec in DATASET_SPECS.items():
+        path = os.path.join(BENCH_DIR, spec["out"])
         if os.path.exists(path):
             adata = ad.read_h5ad(path)
             n_types = adata.obs["cell_type"].nunique()
-            print(f"  {name:<15} {adata.n_obs:>7,} cells  {adata.n_vars:>6,} genes  "
+            print(f"  {dataset:<15} {adata.n_obs:>7,} cells  {adata.n_vars:>6,} genes  "
                   f"{n_types:>3} types")
         else:
-            print(f"  {name:<15} NOT FOUND")
+            print(f"  {dataset:<15} NOT FOUND")
 
 
 if __name__ == "__main__":

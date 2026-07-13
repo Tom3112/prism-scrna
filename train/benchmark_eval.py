@@ -2,10 +2,14 @@
 5-fold cross-validation evaluation on standard benchmark datasets.
 
 Compares our model against published baselines:
-  - Original 5 (scBiGNN, Ma et al. 2023, Table 2)
-  - Extended 5 (ACTINN, Chen et al. 2019, Tables 2-3)
-
-All 10 datasets are from the same Zenodo archive (Abdelaal et al. 2019).
+  - Original 5 (scBiGNN, Ma et al. 2023, Table 2) — verified exact match
+  - Segerstolpe/Muraro (ACTINN, Ma & Pellegrini 2020) — from the same Abdelaal
+    et al. 2019 benchmark suite (Zenodo 3357167); dataset stats verified against
+    Abdelaal's Table 2, accuracy values not independently re-derived from the
+    source figure
+  - Zeisel/Macosko/Klein: no verified baseline. Despite prior attribution to
+    Abdelaal et al. 2019, these 3 datasets do not appear in that paper or in
+    scBiGNN's — reported standalone rather than against an unconfirmed number.
 
   Dataset      | Baseline | Method   | ours
   -------------|----------|----------|-----
@@ -14,17 +18,24 @@ All 10 datasets are from the same Zenodo archive (Abdelaal et al. 2019).
   BaronHuman   |  0.983   | scBiGNN  |  ?
   BaronMouse   |  0.983   | scBiGNN  |  ?
   AMB          |  0.994   | scBiGNN  |  ?
-  Zeisel       |  0.944   | ACTINN   |  ?
   Segerstolpe  |  0.886   | ACTINN   |  ?
   Muraro       |  0.962   | ACTINN   |  ?
-  Macosko      |  0.798   | ACTINN   |  ?
-  Klein        |  0.979   | ACTINN   |  ?
+  Zeisel       |    —     |    —     |  ?
+  Macosko      |    —     |    —     |  ?
+  Klein        |    —     |    —     |  ?
 
 Usage:
-    uv run python train/benchmark_eval.py
+    uv run python train/benchmark_eval.py                    # plain baseline (no GNN)
     uv run python train/benchmark_eval.py --dataset BaronHuman
-    uv run python train/benchmark_eval.py --head gat   # use GNN-as-classifier
+    uv run python train/benchmark_eval.py --gnn frozen        # GeneGAT frozen (Option A)
+    uv run python train/benchmark_eval.py --gnn joint         # GeneGAT joint (Option A)
+    uv run python train/benchmark_eval.py --head gat          # CellGAT head (Option B)
+    uv run python train/benchmark_eval.py --head cellgraph    # CellGraph head (Option C)
+    uv run python train/benchmark_eval.py --head emcellgraph  # EM-refined full-dataset cell graph (Option C2)
     uv run python train/benchmark_eval.py --dataset Zeisel --epochs 20
+
+Results are saved per-variant to experiments/benchmark_results_<head>_<gnn>.npy so
+different --head/--gnn runs don't overwrite each other.
 """
 
 from __future__ import annotations
@@ -44,17 +55,27 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from data.benchmark_utils import load_benchmark, make_kfold_splits, BENCHMARK_FILES, BENCH_DIR
 from data.dataset import scRNADataset
 from model.transformer import scRNAEncoder
-from model.heads import CellTypeClassificationHead, CellGATClassificationHead
+from model.heads import (
+    CellTypeClassificationHead,
+    CellGATClassificationHead,
+    CellGraphClassificationHead,
+    EMCellGraphClassificationHead,
+)
 from model.gene_graph import build_gene_graph
+from model.gnn import build_gene_gat, GlobalCellGraph
 from train.config import DataConfig, ModelConfig, FinetuneConfig
 from train.pretrain import get_cosine_schedule_with_warmup
 from eval.metrics import collect_predictions, compute_metrics, _forward_head
 
 # Published baselines for 5-fold CV accuracy.
 #
-# Original 5: scBiGNN (Ma et al. 2023, Table 2) — direct comparison target.
-# Extended 5: ACTINN (Chen et al. 2019, Tables 2-3) — strong supervised baseline
-#             from the same Abdelaal et al. 2019 benchmark suite.
+# Original 5: scBiGNN (Ma et al. 2023, Table 2) — verified exact match, direct
+#             comparison target.
+# Segerstolpe/Muraro: ACTINN (Ma & Pellegrini 2020), from the same Abdelaal
+#             et al. 2019 benchmark suite.
+# Zeisel/Macosko/Klein have no entry here — no verified baseline (see module
+# docstring); evaluate_dataset() reports these standalone via BASELINES.get()'s
+# (None, None) default.
 BASELINES: dict[str, tuple[str, float]] = {
     # dataset          method      accuracy
     "Zheng68K":    ("scBiGNN",  0.760),
@@ -62,15 +83,24 @@ BASELINES: dict[str, tuple[str, float]] = {
     "BaronHuman":  ("scBiGNN",  0.983),
     "BaronMouse":  ("scBiGNN",  0.983),
     "AMB":         ("scBiGNN",  0.994),
-    "Zeisel":      ("ACTINN",   0.944),
     "Segerstolpe": ("ACTINN",   0.886),
     "Muraro":      ("ACTINN",   0.962),
-    "Macosko":     ("ACTINN",   0.798),
-    "Klein":       ("ACTINN",   0.979),
 }
 
 # Keep old name as alias for backward compatibility
 SCBIGNN_BASELINE = {k: v for k, (_, v) in BASELINES.items() if _[0] == "scBiGNN"}
+
+# STRING species per dataset — BaronMouse and AMB are mouse; STRING won't match
+# mouse gene symbols against the human (9606) network, so PPI lookups for those
+# two would silently return near-empty graphs without this.
+STRING_SPECIES_BY_DATASET = {
+    "BaronMouse": 10090,  # Mus musculus
+    "AMB":        10090,  # Mus musculus
+}
+
+
+def _species_for(name: str) -> int:
+    return STRING_SPECIES_BY_DATASET.get(name, 9606)
 
 
 def _get_device() -> torch.device:
@@ -79,6 +109,27 @@ def _get_device() -> torch.device:
     if torch.backends.mps.is_available():
         return torch.device("mps")
     return torch.device("cpu")
+
+
+@torch.no_grad()
+def _refresh_graph(encoder, train_loader_seq, test_loader, device, n_total: int,
+                    global_graph: GlobalCellGraph) -> None:
+    """
+    The "E-step": takes a full-fold CLS embedding snapshot (train + test
+    combined, transductive — test structure visible, test labels never used)
+    and rebuilds GlobalCellGraph's neighbor cache from it. Embeddings are
+    scattered into (n_total, hidden_dim) at each sample's own "idx", so this
+    is correct regardless of loader shuffling or batch order.
+    """
+    encoder.eval()
+    out = torch.zeros(n_total, encoder.hidden_dim, device=device)
+    for loader in (train_loader_seq, test_loader):
+        for batch in loader:
+            ids  = batch["input_ids"].to(device)
+            amsk = batch["attention_mask"].to(device)
+            idx  = batch["idx"].to(device)
+            out[idx] = encoder.get_cls_embedding(ids, amsk)
+    global_graph.refresh(out)
 
 
 def train_one_fold(
@@ -91,6 +142,7 @@ def train_one_fold(
     pretrain_ckpt: str | None,
     ppi_edge_index: torch.Tensor | None = None,
     ppi_edge_weight: torch.Tensor | None = None,
+    gene_gat=None,
 ) -> tuple[float, float]:
     """Train on one fold, return (accuracy, macro_f1)."""
 
@@ -101,10 +153,19 @@ def train_one_fold(
         a.obs["cell_type"] = a.obs["cell_type"].cat.set_categories(all_cats)
     num_classes = len(all_cats)
 
+    # EM cell graph (Option C2) is transductive: it needs a full-dataset view
+    # of the FOLD's cells (train + test) to build each cell's TRUE nearest
+    # neighbors, not just whichever cells share a training batch. Test cells'
+    # STRUCTURE is visible (their embeddings), never their labels — same
+    # convention as standard transductive GNN training. index_offset gives
+    # train and test disjoint index ranges so one combined embedding tensor
+    # can be queried consistently by either split's "idx".
+    n_train = train_adata.n_obs
     train_ds = scRNADataset(train_adata, max_seq_len=data_cfg.max_seq_len,
                             mask_ratio=data_cfg.mask_ratio, mode="finetune")
     test_ds  = scRNADataset(test_adata,  max_seq_len=data_cfg.max_seq_len,
-                            mask_ratio=data_cfg.mask_ratio, mode="finetune")
+                            mask_ratio=data_cfg.mask_ratio, mode="finetune",
+                            index_offset=n_train)
 
     train_loader = DataLoader(train_ds, batch_size=ft_cfg.batch_size,
                               shuffle=True, num_workers=data_cfg.num_workers,
@@ -112,6 +173,11 @@ def train_one_fold(
     test_loader  = DataLoader(test_ds,  batch_size=ft_cfg.batch_size,
                               shuffle=False, num_workers=data_cfg.num_workers,
                               pin_memory=device.type == "cuda")
+    # Unshuffled train loader for embedding snapshots — order doesn't
+    # actually matter (scattered by "idx"), but avoids reshuffling overhead.
+    train_loader_seq = DataLoader(train_ds, batch_size=ft_cfg.batch_size,
+                                  shuffle=False, num_workers=data_cfg.num_workers,
+                                  pin_memory=device.type == "cuda")
 
     vocab_size = train_ds.vocab_size
     encoder = scRNAEncoder(
@@ -122,12 +188,14 @@ def train_one_fold(
         ffn_dim=model_cfg.ffn_dim,
         dropout=model_cfg.dropout,
         max_seq_len=data_cfg.max_seq_len,
+        gene_gat=gene_gat,
     ).to(device)
 
     if pretrain_ckpt and os.path.exists(pretrain_ckpt):
         ckpt = torch.load(pretrain_ckpt, map_location=device)
         encoder.load_state_dict(ckpt["encoder_state"], strict=False)
 
+    global_graph = None
     if model_cfg.use_gat_head and ppi_edge_index is not None:
         head = CellGATClassificationHead(
             hidden_dim=model_cfg.hidden_dim,
@@ -138,6 +206,25 @@ def train_one_fold(
             ppi_edge_weight=ppi_edge_weight.to(device),
             n_gat_heads=model_cfg.gat_head_n_heads,
         ).to(device)
+    elif model_cfg.use_cell_graph:
+        head = CellGraphClassificationHead(
+            hidden_dim=model_cfg.hidden_dim,
+            num_classes=num_classes,
+            dropout=model_cfg.dropout,
+            k=model_cfg.cell_graph_k,
+            n_heads=model_cfg.cell_graph_heads,
+        ).to(device)
+    elif model_cfg.use_em_cell_graph:
+        head = EMCellGraphClassificationHead(
+            hidden_dim=model_cfg.hidden_dim,
+            num_classes=num_classes,
+            dropout=model_cfg.dropout,
+        ).to(device)
+        global_graph = GlobalCellGraph(k=model_cfg.em_graph_k)
+        head.graph = global_graph  # looked up by eval/metrics.py's _forward_head
+        n_total = n_train + test_adata.n_obs
+        # Initial E-step, before any training — from the loaded (or random) encoder.
+        _refresh_graph(encoder, train_loader_seq, test_loader, device, n_total, global_graph)
     else:
         head = CellTypeClassificationHead(
             hidden_dim=model_cfg.hidden_dim,
@@ -151,6 +238,7 @@ def train_one_fold(
     )
     total_steps = ft_cfg.epochs * len(train_loader)
     scheduler = get_cosine_schedule_with_warmup(optimizer, ft_cfg.warmup_steps, total_steps)
+    scaler = torch.cuda.amp.GradScaler(enabled=(device.type == "cuda"))
 
     for epoch in range(1, ft_cfg.epochs + 1):
         encoder.train(); head.train()
@@ -158,15 +246,33 @@ def train_one_fold(
             ids  = batch["input_ids"].to(device)
             amsk = batch["attention_mask"].to(device)
             ct   = batch["cell_type"].to(device)
-            loss, _ = _forward_head(encoder, head, ids, amsk, ct)
-            optimizer.zero_grad(); loss.backward()
-            torch.nn.utils.clip_grad_norm_(
-                list(encoder.parameters()) + list(head.parameters()), ft_cfg.grad_clip)
-            optimizer.step(); scheduler.step()
+            idx  = batch["idx"].to(device) if global_graph is not None else None
+            optimizer.zero_grad()
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=scaler.is_enabled()):
+                loss, _ = _forward_head(encoder, head, ids, amsk, ct, idx=idx)
+            params = list(encoder.parameters()) + list(head.parameters())
+            if scaler.is_enabled():
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(params, ft_cfg.grad_clip)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(params, ft_cfg.grad_clip)
+                optimizer.step()
+            scheduler.step()
+
+        # E-step: rebuild the full-dataset graph from the now-updated encoder,
+        # every em_graph_refresh_every epochs (M-step is the training above,
+        # which used whatever graph was current at the time).
+        if global_graph is not None and epoch % model_cfg.em_graph_refresh_every == 0:
+            n_total = n_train + test_adata.n_obs
+            _refresh_graph(encoder, train_loader_seq, test_loader, device, n_total, global_graph)
 
     preds, labels = collect_predictions(encoder, head, test_loader, device)
     metrics = compute_metrics(preds, labels, all_cats)
-    return metrics["accuracy"], metrics["macro_f1"]
+    return metrics["accuracy"], metrics["macro_f1"], metrics["median_f1"]
 
 
 def evaluate_dataset(
@@ -178,76 +284,107 @@ def evaluate_dataset(
     pretrain_ckpt: str | None,
     k: int = 5,
 ) -> dict:
+    gnn_label = "none"
+    if model_cfg.use_gnn:
+        gnn_label = "frozen" if model_cfg.gnn_freeze else "joint"
+    head_label = (
+        "GAT" if model_cfg.use_gat_head else
+        "CellGraph" if model_cfg.use_cell_graph else
+        "EMCellGraph" if model_cfg.use_em_cell_graph else
+        "CLS"
+    )
     print(f"\n{'='*60}")
-    print(f"Dataset: {name}  ({k}-fold CV)  head={'GAT' if model_cfg.use_gat_head else 'CLS'}")
+    print(f"Dataset: {name}  ({k}-fold CV)  head={head_label}  gnn={gnn_label}")
     print(f"{'='*60}")
 
-    adata  = load_benchmark(name)
-    splits = make_kfold_splits(adata, k=k)
+    adata   = load_benchmark(name)
+    splits  = make_kfold_splits(adata, k=k)
+    species = _species_for(name)
+
+    # processed_path needed as co-expression fallback if STRING API is unreachable
+    proc_path = os.path.join(BENCH_DIR, BENCHMARK_FILES[name]).replace(".h5ad", "_processed.h5ad")
 
     # Build PPI graph once for the whole dataset (same HVGs across all folds)
     ppi_edge_index = ppi_edge_weight = None
     if model_cfg.use_gat_head:
         gene_names   = list(adata.var_names)
         ppi_cache_dir = os.path.join(BENCH_DIR, f"{name}_ppi")
-        print(f"  Building PPI graph for {len(gene_names)} genes …")
+        print(f"  Building PPI graph for {len(gene_names)} genes (species={species}) …")
         ppi_edge_index, ppi_edge_weight = build_gene_graph(
             gene_names,
             cache_dir=ppi_cache_dir,
             min_score=model_cfg.string_min_score,
+            species=species,
+            processed_path=proc_path,
         )
 
-    fold_accs, fold_f1s = [], []
+    # GeneGAT (Option A) is trainable in joint mode, so it must be rebuilt fresh
+    # per fold — reusing one instance across folds would leak fold N's trained
+    # GAT weights into fold N+1, breaking CV independence. The underlying STRING
+    # edge_index/edge_weight are still disk-cached, so rebuilding the nn.Module
+    # wrapper each fold is cheap.
+    if not model_cfg.use_gnn:
+        proc_path = None
+
+    fold_accs, fold_f1s, fold_median_f1s = [], [], []
     for fold, (train_idx, test_idx) in enumerate(splits, 1):
         t0 = time.time()
         train_a = adata[train_idx].copy()
         test_a  = adata[test_idx].copy()
-        acc, f1 = train_one_fold(
+        gene_gat = None
+        if model_cfg.use_gnn:
+            gene_gat = build_gene_gat(model_cfg, proc_path, device, species=species)
+        acc, f1, median_f1 = train_one_fold(
             train_a, test_a, model_cfg, data_cfg, ft_cfg, device, pretrain_ckpt,
             ppi_edge_index=ppi_edge_index, ppi_edge_weight=ppi_edge_weight,
+            gene_gat=gene_gat,
         )
-        fold_accs.append(acc); fold_f1s.append(f1)
-        print(f"  Fold {fold}/{k}  acc={acc:.4f}  macro_f1={f1:.4f}  ({time.time()-t0:.1f}s)")
+        fold_accs.append(acc); fold_f1s.append(f1); fold_median_f1s.append(median_f1)
+        print(f"  Fold {fold}/{k}  acc={acc:.4f}  macro_f1={f1:.4f}  median_f1={median_f1:.4f}  ({time.time()-t0:.1f}s)")
 
     mean_acc = np.mean(fold_accs)
     std_acc  = np.std(fold_accs)
     mean_f1  = np.mean(fold_f1s)
+    mean_median_f1 = np.mean(fold_median_f1s)
 
     ref_method, ref_acc = BASELINES.get(name, (None, None))
     delta = mean_acc - ref_acc if ref_acc is not None else None
 
-    print(f"\n  Mean acc : {mean_acc:.4f} ± {std_acc:.4f}")
-    print(f"  Mean F1  : {mean_f1:.4f}")
+    print(f"\n  Mean acc       : {mean_acc:.4f} ± {std_acc:.4f}")
+    print(f"  Mean macro F1  : {mean_f1:.4f}")
+    print(f"  Mean median F1 : {mean_median_f1:.4f}  (Abdelaal et al. 2019's primary metric — robust to rare-class outliers)")
     if ref_acc is not None:
         sign = "▲" if delta > 0 else "▼"
         print(f"  vs {ref_method}: {sign} {abs(delta)*100:.2f}%  "
               f"({ref_acc:.4f} → {mean_acc:.4f})")
 
     return {
-        "dataset":    name,
-        "mean_acc":   mean_acc,
-        "std_acc":    std_acc,
-        "mean_f1":    mean_f1,
-        "fold_accs":  fold_accs,
-        "ref_method": ref_method,
-        "ref_acc":    ref_acc,
-        "delta":      delta,
+        "dataset":        name,
+        "mean_acc":       mean_acc,
+        "std_acc":        std_acc,
+        "mean_f1":        mean_f1,
+        "mean_median_f1": mean_median_f1,
+        "fold_accs":      fold_accs,
+        "fold_median_f1s": fold_median_f1s,
+        "ref_method":     ref_method,
+        "ref_acc":        ref_acc,
+        "delta":          delta,
     }
 
 
 def print_summary_table(results: list[dict]):
-    print(f"\n{'='*78}")
+    print(f"\n{'='*90}")
     print("BENCHMARK SUMMARY")
-    print(f"{'='*78}")
-    print(f"{'Dataset':<15} {'Ours (acc)':<18} {'Baseline':<10} {'Method':<12} {'Δ':>8}")
-    print("-" * 65)
+    print(f"{'='*90}")
+    print(f"{'Dataset':<15} {'Ours (acc)':<18} {'Median F1':<11} {'Baseline':<10} {'Method':<12} {'Δ':>8}")
+    print("-" * 78)
     for r in results:
         delta_str  = f"{r['delta']*100:+.2f}%" if r["delta"] is not None else "—"
         ref_str    = f"{r['ref_acc']:.3f}" if r["ref_acc"] is not None else "—"
         method_str = r["ref_method"] or "—"
         print(f"{r['dataset']:<15} {r['mean_acc']:.4f} ± {r['std_acc']:.4f}  "
-              f"{ref_str:<10} {method_str:<12} {delta_str:>8}")
-    print(f"{'='*78}")
+              f"{r['mean_median_f1']:<11.4f} {ref_str:<10} {method_str:<12} {delta_str:>8}")
+    print(f"{'='*90}")
 
 
 def main():
@@ -260,12 +397,23 @@ def main():
                         help="Path to pretrained encoder checkpoint")
     parser.add_argument("--k", type=int, default=5, help="Number of CV folds")
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--head", choices=["cls", "gat"], default="cls",
-                        help="cls = [CLS] linear probe; gat = CellGAT (PPI graph during classification)")
+    parser.add_argument("--head", choices=["cls", "gat", "cellgraph", "emcellgraph"], default="cls",
+                        help="cls = [CLS] linear probe; gat = CellGAT (gene-level PPI graph "
+                             "during classification, Option B); cellgraph = CellGraph "
+                             "(batch-level cell-cell k-NN graph, Option C); emcellgraph = "
+                             "EMCellGraph (full-dataset, EM-refined cell-cell graph, Option C2)")
+    parser.add_argument("--gnn", choices=["none", "frozen", "joint"], default="none",
+                        help="none = plain nn.Embedding; frozen/joint = GeneGAT gene embeddings (Option A)")
     args = parser.parse_args()
 
     device     = _get_device()
-    model_cfg  = ModelConfig(use_gat_head=(args.head == "gat"))
+    model_cfg  = ModelConfig(
+        use_gat_head=(args.head == "gat"),
+        use_cell_graph=(args.head == "cellgraph"),
+        use_em_cell_graph=(args.head == "emcellgraph"),
+        use_gnn=(args.gnn != "none"),
+        gnn_freeze=(args.gnn == "frozen"),
+    )
     data_cfg   = DataConfig()
     ft_cfg     = FinetuneConfig(epochs=args.epochs)
 
@@ -285,8 +433,9 @@ def main():
 
     if results:
         print_summary_table(results)
+        variant = f"{args.head}_{args.gnn}"
         out = os.path.join(os.path.dirname(__file__), "..", "experiments",
-                           "benchmark_results.npy")
+                           f"benchmark_results_{variant}.npy")
         os.makedirs(os.path.dirname(out), exist_ok=True)
         np.save(out, results)
         print(f"\nResults saved to {out}")

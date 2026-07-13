@@ -22,19 +22,34 @@ def preprocess(raw_path: str = RAW_PATH, out_path: str = PROCESSED_PATH) -> sc.A
     print(f"Loading {raw_path}")
     adata = sc.read_h5ad(raw_path)
 
-    # --- QC filters ---
-    sc.pp.filter_cells(adata, min_genes=MIN_GENES)
-    sc.pp.filter_cells(adata, min_counts=MIN_COUNTS)
-    sc.pp.filter_genes(adata, min_cells=MIN_CELLS)
-    print(f"After QC: {adata.n_obs} cells, {adata.n_vars} genes")
+    if "louvain" in adata.obs.columns and adata.raw is not None:
+        # pbmc3k_processed(): adata.X has already been scaled/clipped
+        # (sc.pp.scale, values roughly in [-3, 10]) for PCA/clustering — not
+        # expression values, so rank/expr_bin tokenization would be meaningless
+        # on it. adata.raw.X retains the pre-scaling log1p-normalized values
+        # (13,714 genes), which is the same stage our own pipeline normally
+        # produces — use that instead, then apply our own HVG selection.
+        print(f"Detected pbmc3k_processed() input ({adata.n_obs} cells) — "
+              f"using .raw (log-normalized) instead of scaled/clipped .X")
+        raw_adata = adata.raw.to_adata()
+        raw_adata.obs = adata.obs.copy()
+        adata = raw_adata
+        sc.pp.highly_variable_genes(adata, n_top_genes=min(N_HVG, adata.n_vars), subset=True)
+        print(f"HVGs selected: {adata.n_vars}")
+    else:
+        # --- QC filters ---
+        sc.pp.filter_cells(adata, min_genes=MIN_GENES)
+        sc.pp.filter_cells(adata, min_counts=MIN_COUNTS)
+        sc.pp.filter_genes(adata, min_cells=MIN_CELLS)
+        print(f"After QC: {adata.n_obs} cells, {adata.n_vars} genes")
 
-    # --- Normalization ---
-    sc.pp.normalize_total(adata, target_sum=N_COUNTS_NORM)
-    sc.pp.log1p(adata)
+        # --- Normalization ---
+        sc.pp.normalize_total(adata, target_sum=N_COUNTS_NORM)
+        sc.pp.log1p(adata)
 
-    # --- HVG selection ---
-    sc.pp.highly_variable_genes(adata, n_top_genes=N_HVG, subset=True)
-    print(f"HVGs selected: {adata.n_vars}")
+        # --- HVG selection ---
+        sc.pp.highly_variable_genes(adata, n_top_genes=N_HVG, subset=True)
+        print(f"HVGs selected: {adata.n_vars}")
 
     # --- Cell-type labels ---
     # pbmc3k_processed already has louvain; re-annotate with coarse labels.
@@ -49,18 +64,13 @@ def preprocess(raw_path: str = RAW_PATH, out_path: str = PROCESSED_PATH) -> sc.A
 def _annotate_cell_types(adata: sc.AnnData) -> None:
     """
     Cluster with Leiden and assign coarse PBMC cell-type labels.
-    Falls back to louvain if already present (pbmc3k).
+    Falls back to louvain if already present (pbmc3k_processed()).
     """
     if "louvain" in adata.obs.columns:
-        # pbmc3k canonical louvain → coarse labels
-        mapping = {
-            "0": "CD4 T", "1": "CD14 Monocytes", "2": "B",
-            "3": "CD8 T", "4": "NK", "5": "FCGR3A Monocytes",
-            "6": "Dendritic", "7": "Megakaryocytes",
-        }
-        adata.obs["cell_type"] = (
-            adata.obs["louvain"].astype(str).map(mapping).fillna("Unknown").astype("category")
-        )
+        # pbmc3k_processed()'s louvain column already holds real annotated
+        # names (e.g. "CD4 T cells", "CD14+ Monocytes") from the scanpy
+        # clustering tutorial — use directly, no cluster-id mapping needed.
+        adata.obs["cell_type"] = adata.obs["louvain"].astype("category")
         return
 
     # Generic path: compute neighbors → Leiden clusters

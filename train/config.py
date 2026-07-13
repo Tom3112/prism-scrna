@@ -23,6 +23,9 @@ class DataConfig:
     val_frac: float = 0.1
     num_workers: int = _DEFAULT_NUM_WORKERS
     seed: int = 42
+    # Tokenization scheme: "rank" (Geneformer-style) or "expr_bin" (scBERT-style)
+    tokenization: str = "rank"
+    n_bins: int = 10  # non-zero expression bins, only used for "expr_bin"
 
 
 @dataclass
@@ -44,6 +47,16 @@ class ModelConfig:
     # GNN classifier head (Option B — PPI graph used DURING classification)
     use_gat_head: bool = False          # False = CLS linear probe, True = CellGATHead
     gat_head_n_heads: int = 4           # attention heads in the classification GAT
+
+    # Cell-cell GNN classifier head (Option C — batch-level cell k-NN graph)
+    use_cell_graph: bool = False        # True = CellGraphClassificationHead
+    cell_graph_k: int = 5               # neighbors per cell in the k-NN graph
+    cell_graph_heads: int = 4           # attention heads in the cell-cell GAT
+
+    # Cell-cell GNN, EM-refined (Option C2 — full-dataset graph, not batch-level)
+    use_em_cell_graph: bool = False      # True = EMCellGraphClassificationHead
+    em_graph_k: int = 5                  # neighbors per cell in the full-dataset graph
+    em_graph_refresh_every: int = 1      # rebuild the graph every N epochs (the "E-step")
 
 
 @dataclass

@@ -28,7 +28,8 @@ def extract_cls_embeddings(
     for batch in loader:
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
-        emb = encoder.get_cls_embedding(input_ids, attention_mask).cpu().numpy()
+        bin_ids = batch["bin_ids"].to(device) if "bin_ids" in batch else None
+        emb = encoder.get_cls_embedding(input_ids, attention_mask, bin_ids).cpu().numpy()
         embs.append(emb)
         if "cell_type" in batch:
             labels.append(batch["cell_type"].numpy())

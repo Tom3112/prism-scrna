@@ -16,18 +16,17 @@ from sklearn.model_selection import StratifiedKFold
 BENCH_DIR = os.path.join(os.path.dirname(__file__), "..", "data", "benchmarks")
 
 BENCHMARK_FILES = {
-    # Original 5 — used by scBiGNN (direct baseline)
+    # scBiGNN baseline
     "BaronHuman":  "baron_human.h5ad",
     "BaronMouse":  "baron_mouse.h5ad",
     "AMB":         "amb.h5ad",
     "Zheng68K":    "zheng68k.h5ad",
     "Zhengsorted": "zhengsorted.h5ad",
-    # Extended 5 — from same Zenodo archive (Abdelaal et al. 2019)
-    "Zeisel":      "zeisel.h5ad",       # mouse brain, 9 types
-    "Segerstolpe": "segerstolpe.h5ad",  # human pancreas, 14 types
+    # ACTINN baseline — same Zenodo archive (Abdelaal et al. 2019)
+    "Segerstolpe": "segerstolpe.h5ad",  # human pancreas, 13 types
     "Muraro":      "muraro.h5ad",       # human pancreas, 9 types
-    "Macosko":     "macosko.h5ad",      # mouse retina, 39 types
-    "Klein":       "klein.h5ad",        # mouse ESC, 4 types
+    # Zeisel/Macosko/Klein dropped: not present in this Zenodo archive at all
+    # (verified by listing its full contents) — see README.md's Benchmarks section.
 }
 
 N_HVG       = 2000

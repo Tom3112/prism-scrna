@@ -1,14 +1,24 @@
 """
 Task-specific heads that attach to scRNAEncoder.
 
-Two classification heads are provided:
+Three classification heads are provided:
 
   CellTypeClassificationHead  — baseline: linear probe on [CLS] token.
-  CellGATClassificationHead   — GNN-as-classifier: uses the STRING PPI graph
-      *during* the classification forward pass (not just embedding init).
-      Gene hidden states are refined by a GATConv layer (PPI edges) then
-      pooled via attention → cell embedding → linear head.
-      This closes the architectural gap with scBiGNN-style methods.
+  CellGATClassificationHead   — GNN-as-classifier (Option B): uses the STRING
+      PPI graph *during* the classification forward pass (not just embedding
+      init). Gene hidden states are refined by a GATConv layer (PPI edges)
+      then pooled via attention → cell embedding → linear head. Closes the
+      architectural gap with scBiGNN-style gene-level GNNs.
+  CellGraphClassificationHead — cell-cell GNN (Option C): refines the [CLS]
+      embedding using a k-NN graph over OTHER CELLS IN THE SAME BATCH before
+      classifying. Closes the remaining gap with scBiGNN's *bilevel* design —
+      Options A/B both only ever model gene-gene structure; this is PRISM's
+      first cell-cell graph component.
+  EMCellGraphClassificationHead — cell-cell GNN, full-dataset version (Option
+      C, EM-refined): same idea as CellGraphClassificationHead, but attends
+      over each cell's TRUE nearest neighbors from a `GlobalCellGraph`
+      (periodically refreshed over the whole training split, not just the
+      current batch) instead of whichever cells happen to share a minibatch.
 """
 
 from __future__ import annotations
@@ -16,7 +26,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from model.gnn import GATConv
+from model.gnn import GATConv, CellCellGAT
 
 _SPECIAL = 3   # [PAD]=0, [CLS]=1, [MASK]=2 — must match transformer.py
 
@@ -219,6 +229,110 @@ class CellGATClassificationHead(nn.Module):
         cell_emb = (alpha.unsqueeze(-1) * hidden).sum(1)                 # (B, D)
         logits   = self.proj(self.drop(self.norm(cell_emb)))
 
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(logits, labels)
+        return loss, logits
+
+
+class CellGraphClassificationHead(nn.Module):
+    """
+    Option C: refines each cell's [CLS] embedding using a k-NN graph over
+    the OTHER CELLS IN THE SAME BATCH, before classifying.
+
+    Same (cls_emb, labels) -> (loss, logits) interface as
+    CellTypeClassificationHead, so it's a drop-in alternative regardless of
+    which encoder produced cls_emb (plain or GeneGAT-embedded).
+
+    Args:
+        hidden_dim  : transformer hidden dimension.
+        num_classes : number of cell types.
+        dropout     : dropout rate.
+        k           : neighbors per cell in the batch-level k-NN graph.
+        n_heads     : attention heads in the cell-cell GAT layer.
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float = 0.1,
+        k: int = 5,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+        self.cell_gat = CellCellGAT(hidden_dim, k=k, n_heads=n_heads, dropout=dropout)
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.proj = nn.Linear(hidden_dim, num_classes)
+
+    def forward(
+        self,
+        cls_emb: torch.Tensor,               # (B, hidden_dim)
+        labels: torch.Tensor | None = None,  # (B,) integer class ids
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Returns (loss_or_None, logits). logits shape: (B, num_classes)."""
+        refined = self.cell_gat(cls_emb)
+        logits = self.proj(self.drop(self.norm(refined)))
+        loss = None
+        if labels is not None:
+            loss = nn.functional.cross_entropy(logits, labels)
+        return loss, logits
+
+
+class EMCellGraphClassificationHead(nn.Module):
+    """
+    Option C, EM-refined: attends over each cell's TRUE nearest neighbors
+    from a full-dataset `GlobalCellGraph` (see model/gnn.py), instead of
+    CellGraphClassificationHead's batch-level approximation.
+
+    The graph itself lives outside this module (it's host-side state that
+    persists and gets refreshed across an entire epoch, not something that
+    belongs inside an nn.Module's forward pass) — the caller looks up each
+    batch's neighbor embeddings via `GlobalCellGraph.get_neighbors(idx)` and
+    passes them in directly.
+
+    Args:
+        hidden_dim  : transformer hidden dimension.
+        num_classes : number of cell types.
+        dropout     : dropout rate.
+        n_heads     : reserved for future multi-head attention (currently
+                      single-head — the query/key/value split below is
+                      simple scaled dot-product attention over k neighbors).
+    """
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        num_classes: int,
+        dropout: float = 0.1,
+        n_heads: int = 4,
+    ):
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.attn_q = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.attn_k = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.attn_v = nn.Linear(hidden_dim, hidden_dim, bias=False)
+        self.drop = nn.Dropout(dropout)
+        self.norm = nn.LayerNorm(hidden_dim)
+        self.proj = nn.Linear(hidden_dim, num_classes)
+
+    def forward(
+        self,
+        cls_emb: torch.Tensor,               # (B, hidden_dim) — live, differentiable
+        neighbor_emb: torch.Tensor,          # (B, k, hidden_dim) — cached, detached
+        labels: torch.Tensor | None = None,  # (B,) integer class ids
+    ) -> tuple[torch.Tensor | None, torch.Tensor]:
+        """Returns (loss_or_None, logits). logits shape: (B, num_classes)."""
+        q = self.attn_q(cls_emb).unsqueeze(1)                       # (B, 1, D)
+        k = self.attn_k(neighbor_emb)                                # (B, k, D)
+        v = self.attn_v(neighbor_emb)                                # (B, k, D)
+        scores = (q * k).sum(-1) / (self.hidden_dim ** 0.5)          # (B, k)
+        alpha = torch.softmax(scores, dim=-1)                        # (B, k)
+        context = (alpha.unsqueeze(-1) * v).sum(1)                   # (B, D)
+
+        refined = self.norm(cls_emb + context)
+        logits = self.proj(self.drop(refined))
         loss = None
         if labels is not None:
             loss = nn.functional.cross_entropy(logits, labels)
